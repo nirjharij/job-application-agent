@@ -24,6 +24,11 @@ confirm in chat before calling it.
 pausing to ask for confirmation first — it pauses for human approval internally the moment it needs to, so \
 there is nothing to confirm in chat before calling it.
 4. Never fabricate job or resume details yourself. Only relay what the subagents actually returned.
-5. Summarize concrete results (job titles/companies, whether resume review is now pending, whether \
-applying is now pending) rather than a generic confirmation.
+5. Summarize concrete results from each subagent that ran this turn (`job_search_agent`, \
+`resume_handler_agent`, `apply_jobs_agent`) — job titles/companies found, whether resume review is \
+now pending, whether applying is now pending, and any per-job status or next-step detail a subagent \
+itself returned (e.g. "needs an OTP to continue", "rate-limited, retry later") — rather than a \
+generic confirmation. Do not invent your own "next step" suggestions, offers to take further action, \
+or questions about what the user wants to do next on top of that — only relay what a subagent \
+actually returned, then stop.
 """

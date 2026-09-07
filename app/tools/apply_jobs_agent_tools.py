@@ -4,42 +4,11 @@ import re
 from langchain.chat_models import init_chat_model
 from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools
 
 from config import MODEL
 from prompts.job_filler_agent_prompt import JOB_FILLER_AGENT_SYSTEM_PROMPT
 from utilities.jobs_db import mark_job_applied
-from utilities.linkedin_session import STORAGE_STATE_PATH
-
-# Playwright MCP server (npx @playwright/mcp), run headed so a human can review/submit/close each
-# job tab manually. --isolated + --storage-state (rather than a persistent user-data-dir) so the
-# browser starts pre-authenticated to LinkedIn from the cookie seeded by linkedin_session.py, same
-# as the old open_new_tab's storage_state loading. --allow-unrestricted-file-access is needed for
-# browser_file_upload to reach the tailored resume paths written elsewhere in this repo (via
-# os.getcwd(), not necessarily under the MCP subprocess's own cwd).
-PLAYWRIGHT_MCP_CONFIG = {
-    "playwright": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": [
-            "-y",
-            "@playwright/mcp@latest",
-            "--isolated",
-            "--storage-state",
-            str(STORAGE_STATE_PATH),
-            "--allow-unrestricted-file-access",
-        ],
-    }
-}
-
-# One real, visible Playwright MCP browser (via its own subprocess) for the whole app's lifetime —
-# same "launch once, never lazily recreate" contract the raw-Playwright _browser used to have.
-# _mcp_session_cm holds the entered client.session(...) context manager so it isn't garbage
-# collected (which would tear down the session/subprocess) once get_apply_jobs_mcp_tools() returns —
-# mirrors agent.py's _store_cm for PostgresStore.
-_mcp_session_cm = None
-_mcp_session = None
+from utilities.mcp_tools import get_apply_jobs_mcp_tools, get_current_apply_jobs_session
 
 # Populated by start_applying, consumed by post_job_apply — within the same apply_jobs_agent run, so
 # module-level state is enough to hand off between them.
@@ -47,28 +16,6 @@ _pending_jobs: list[dict] = []
 
 # Bounds each job's tool-calling loop below so a confused model can't run forever on one job.
 _MAX_STEPS_PER_JOB = 40
-
-
-async def get_apply_jobs_mcp_tools() -> list:
-    """Launch the shared Playwright MCP session (first call only) and return its tools, minus
-    browser_close (a full browser-process teardown tool — an accidental call would kill the shared,
-    whole-process-lifetime browser the same way an accidental _browser.close() would with raw
-    Playwright).
-
-    Tools are loaded via load_mcp_tools(session) with a manually-held-open session, NOT
-    client.get_tools(server_name=...) (the pattern linkedin_scraper.py uses) — get_tools()/
-    load_mcp_tools(None, connection=...) opens a brand-new session (and thus a brand-new npx
-    @playwright/mcp subprocess + browser) on every single tool call, which would destroy all
-    open-tab state between every click/type/snapshot. Fine for LinkedIn's one-shot search, fatal
-    here.
-    """
-    global _mcp_session_cm, _mcp_session
-    if _mcp_session is None:
-        client = MultiServerMCPClient(PLAYWRIGHT_MCP_CONFIG)
-        _mcp_session_cm = client.session("playwright")
-        _mcp_session = await _mcp_session_cm.__aenter__()
-    tools = await load_mcp_tools(_mcp_session)
-    return [t for t in tools if t.name != "browser_close"]
 
 
 async def _fill_one_job(llm_with_tools, tools_by_name: dict, job: dict, profile_lines: str) -> str:
@@ -154,9 +101,10 @@ async def pending_tabs_open() -> bool:
     """True if any tab this run opened is still open. Polled by the Streamlit UI to decide when to \
     resume apply_jobs_agent's post_job_apply interrupt — the actual wait for the human to review, \
     submit, and close each tab happens there, not inside this module."""
-    if _mcp_session is None:
+    session = get_current_apply_jobs_session()
+    if session is None:
         return False
-    result = await _mcp_session.call_tool("browser_tabs", {"action": "list"})
+    result = await session.call_tool("browser_tabs", {"action": "list"})
     text = result.content[0].text if result.content else ""
     urls = re.findall(r"\]\((\S+)\)", text)
     return any(url != "about:blank" for url in urls)

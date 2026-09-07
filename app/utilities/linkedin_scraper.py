@@ -1,24 +1,8 @@
 import csv
 import json
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
 from utilities.jobs_db import is_job_applied
-
-LINKEDIN_MCP_CONFIG = {
-    "mcp-server-linkedin": {
-        "transport": "stdio",
-        "command": "uv",
-        "args": [
-            "run",
-            "--directory",
-            "/Users/nirjharijankar/projects/linkedin-mcp-server-pr727",
-            "-m",
-            "linkedin_mcp_server",
-        ],
-        "env": {"UV_HTTP_TIMEOUT": "300"},
-    }
-}
+from utilities.mcp_tools import get_linkedin_mcp_tools
 
 CSV_FIELDNAMES = [
     "title",
@@ -34,31 +18,19 @@ CSV_FIELDNAMES = [
 ]
 
 class LinkedInJobScraper:
-    def __init__(self):
-        self.client = MultiServerMCPClient(LINKEDIN_MCP_CONFIG)
-        self.tools = None
-
-    async def _get_tools(self):
-        """Fetch tools from the MCP server on first use only, so every scrape after the first reuses
-        the same client/session instead of spinning up a new mcp-server-linkedin subprocess."""
-        if self.tools is None:
-            self.tools = await self.client.get_tools(server_name="mcp-server-linkedin")
-        return self.tools
-
     async def scrape_linkedin_jobs_to_csv(self, role: str, location: str, output_csv: str, limit: int = 3) -> None:
         """Search LinkedIn for jobs (via the authenticated mcp-server-linkedin MCP server) and save to csv.
 
         Requires a logged-in LinkedIn session — run `uvx mcp-server-linkedin@latest --login` once beforehand.
         """
 
-        tools_by_name = {t.name: t for t in await self._get_tools()}
+        tools_by_name = {t.name: t for t in await get_linkedin_mcp_tools()}
         search_jobs = tools_by_name.get("search_jobs")
         get_job_details = tools_by_name.get("get_job_details")
 
         search_result = self._extract_json(
             await search_jobs.ainvoke({"keywords": role, "location": location, "max_pages": 1})
         )
-        print("Search Result: " + str(search_result))
         job_ids = search_result.get("job_ids", [])[:limit]
         titles_by_id = {
             ref["url"].strip("/").split("/")[-1]: ref["text"]
@@ -184,7 +156,7 @@ class LinkedInJobScraper:
 
 
 # Single shared instance so every scrape reuses the same MCP client/session instead of spawning a
-# new mcp-server-linkedin subprocess per call — see LinkedInJobScraper._get_tools.
+# new mcp-server-linkedin subprocess per call — see get_linkedin_mcp_tools.
 _scraper = LinkedInJobScraper()
 
 
