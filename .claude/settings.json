@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post_write_lint.py\"",
+            "timeout": 30,
+            "statusMessage": "Running ruff lint check..."
+          }
+        ]
+      }
+    ]
+  }
+}

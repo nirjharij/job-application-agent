@@ -2,6 +2,8 @@ import asyncio
 import base64
 import csv
 import os
+import time
+import traceback
 import uuid
 
 import streamlit as st
@@ -9,49 +11,69 @@ from langchain.messages import HumanMessage
 from langgraph.types import Command
 
 from agent import build_agent
-from browser import open_job_in_browser
+from tools.apply_jobs_agent_tools import pending_tabs_open
 
 st.set_page_config(page_title="Job Application Agent", layout="wide")
 
 
 @st.cache_resource
+def get_event_loop():
+    # A single persistent loop for the whole process, reused by every run() call below (including
+    # the one that builds the agents) — asyncio.run() creates *and closes* a fresh loop each call,
+    # which would leave apply_jobs_agent_tools.py's shared Playwright browser connection (opened
+    # inside whichever loop built it) unusable from every subsequent call on a different loop, since
+    # asyncio transports can't be used across event loops. See CLAUDE.md's "Applying to jobs" section
+    # for the related must-use-async-API note this pitfall is adjacent to.
+    return asyncio.new_event_loop()
+
+
+def run(coro):
+    try:
+        return get_event_loop().run_until_complete(coro)
+    except BaseException:
+        # Streamlit's own error display truncates some tracebacks (e.g. uvloop's Cython frames
+        # don't preserve the full Python call chain) — log the complete one to disk so a crash can
+        # actually be diagnosed, without changing what the user sees in the UI.
+        with open("error.log", "a", encoding="utf-8") as f:
+            f.write(f"\n{'=' * 80}\n{time.strftime('%Y-%m-%d %H:%M:%S')} phase={st.session_state.get('phase')}\n")
+            traceback.print_exc(file=f)
+        raise
+
+
+@st.cache_resource
 def get_agents():
-    return asyncio.run(build_agent())
+    return run(build_agent())
 
 
 agents = get_agents()
 main_agent = agents["main_agent"]
-resume_handler_agent = agents["resume_handler_agent"]
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "phase" not in st.session_state:
-    st.session_state.phase = "idle"  # idle -> searching -> analyzing -> reviewing -> resuming -> done
-if "job_response" not in st.session_state:
-    st.session_state.job_response = None
-if "resume_response" not in st.session_state:
-    st.session_state.resume_response = None
+    # idle -> starting -> reviewing -> applying_wait -> resuming -> done
+    # (resuming is shared: it's used both after "Continue" in reviewing, and after every
+    # application tab is closed in applying_wait, since both are just resuming main_agent's
+    # own interrupted thread)
+    st.session_state.phase = "idle"
+if "main_response" not in st.session_state:
+    st.session_state.main_response = None
 if "pending_inputs" not in st.session_state:
     st.session_state.pending_inputs = None
-if "opening_job" not in st.session_state:
-    st.session_state.opening_job = None
-
-
-def run(coro):
-    return asyncio.run(coro)
+if "applicant_profile" not in st.session_state:
+    st.session_state.applicant_profile = None
 
 
 def reset_session():
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.phase = "idle"
-    st.session_state.job_response = None
-    st.session_state.resume_response = None
+    st.session_state.main_response = None
     st.session_state.pending_inputs = None
-    st.session_state.opening_job = None
+    st.session_state.applicant_profile = None
 
 
 def update_job_row(csv_path: str, job_url: str, **updates) -> None:
-    """Persist arbitrary per-job fields (decision, apply, tailored_resume_path, ...) back into the jobs csv."""
+    """Persist arbitrary per-job fields (apply, tailored_resume_path, ...) back into the jobs csv."""
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -72,8 +94,27 @@ def update_job_row(csv_path: str, job_url: str, **updates) -> None:
         writer.writerows(rows)
 
 
-main_config = {"configurable": {"thread_id": st.session_state.thread_id}}
-resume_config = {"configurable": {"thread_id": f"{st.session_state.thread_id}-resume-handler"}}
+def advance_phase(response) -> str:
+    """Decide the next phase from main_agent's own response. Since resume_handler_agent and
+    apply_jobs_agent now run nested under main_agent's own checkpointer/thread (see agent.py),
+    their HumanInTheLoopMiddleware interrupts surface directly as main_agent's own __interrupt__
+    instead of a subagent-local one — so this is the single place that inspects it, for both the
+    initial call and every resume."""
+    if not response.get("pathToJobsCsv"):
+        # No jobs csv produced at all (e.g. the model never called the search tool, or the search
+        # itself failed) — nothing to review or apply to yet.
+        return "search_failed"
+    interrupts = response.get("__interrupt__")
+    if interrupts:
+        action_name = interrupts[0].value["action_requests"][0]["name"]
+        if action_name == "resume_corrections_and_download":
+            return "reviewing"
+        if action_name == "post_job_apply":
+            return "applying_wait"
+    return "done"
+
+
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
 with st.sidebar:
     st.header("Job Application Agent")
@@ -92,37 +133,25 @@ st.title("Job Application Agent")
 # (no clickable submit/approve buttons) on the very next rerun, closing the window
 # for a duplicate click to fire a second overlapping call on the same thread.
 
-if st.session_state.opening_job:
-    job = st.session_state.opening_job
-    st.info(f"Opening {job['url']} in a browser window. Close that window when you're done to return here.")
-    with st.spinner("Waiting for you to finish in the browser..."):
-        open_job_in_browser(job["url"])
-    update_job_row(job["csv_path"], job["url"], decision="applied")
-    st.session_state.opening_job = None
-    st.rerun()
-
-elif st.session_state.phase == "searching":
+if st.session_state.phase == "starting":
     inputs = st.session_state.pending_inputs
-    st.info(f"Searching {inputs['platform']} for jobs...")
+    st.info(f"Searching {inputs['platform']} for jobs and analyzing your resume against them...")
     with st.spinner("Working..."):
         response = run(main_agent.ainvoke(
             {
                 "messages": [HumanMessage(
-                    content=f"Find job for {inputs['jobRole']} in {inputs['jobLocation']} on {inputs['platform']}"
+                    content=f"Find {inputs['numJobs']} job(s) for {inputs['jobRole']} in {inputs['jobLocation']} on {inputs['platform']}"
                 )],
                 "platform": inputs["platform"],
+                "numJobs": inputs["numJobs"],
+                "pdfBase64": inputs["pdfBase64"],
+                "applicantProfile": st.session_state.applicant_profile,
             },
-            config=main_config,
+            config=config,
         ))
-    st.session_state.job_response = response
-    if response.get("pathToJobsCsv"):
-        st.session_state.phase = "analyzing"
-    else:
-        # Job search didn't actually produce a jobs csv (e.g. the model never called the search
-        # tool, or the search itself failed) — don't proceed into resume analysis with no csv path,
-        # that would crash the resume_handler_agent instead of surfacing a clear error here.
-        st.session_state.pending_inputs = None
-        st.session_state.phase = "search_failed"
+    st.session_state.main_response = response
+    st.session_state.pending_inputs = None
+    st.session_state.phase = advance_phase(response)
     st.rerun()
 
 elif st.session_state.phase == "search_failed":
@@ -131,70 +160,84 @@ elif st.session_state.phase == "search_failed":
         "find matching jobs, or the search itself failed. See the message below for details, then "
         "try again with a new search."
     )
-    st.write(st.session_state.job_response["messages"][-1].content)
+    st.write(st.session_state.main_response["messages"][-1].content)
     st.button("Start a new search", on_click=reset_session)
-
-elif st.session_state.phase == "analyzing":
-    inputs = st.session_state.pending_inputs
-    csv_path = st.session_state.job_response.get("pathToJobsCsv")
-    st.info("Analyzing your resume against the job descriptions...")
-    with st.spinner("Working..."):
-        response = run(resume_handler_agent.ainvoke(
-            {
-                "messages": [HumanMessage(content="Analyze my resume against the job descriptions, then prepare tailored versions.")],
-                "pdfBase64": inputs["pdfBase64"],
-                "pathToJobsCsv": csv_path,
-            },
-            config=resume_config,
-        ))
-    st.session_state.resume_response = response
-    st.session_state.pending_inputs = None
-    st.session_state.phase = "reviewing" if response.get("__interrupt__") else "done"
-    st.rerun()
 
 elif st.session_state.phase == "resuming":
     st.info("Continuing...")
     with st.spinner("Working..."):
-        response = run(resume_handler_agent.ainvoke(
+        response = run(main_agent.ainvoke(
             Command(resume={"decisions": [{"type": "approve"}]}),
-            config=resume_config,
+            config=config,
         ))
-    st.session_state.resume_response = response
-    st.session_state.phase = "reviewing" if response.get("__interrupt__") else "done"
+    st.session_state.main_response = response
+    st.session_state.phase = advance_phase(response)
     st.rerun()
+
+elif st.session_state.phase == "applying_wait":
+    if run(pending_tabs_open()):
+        st.info("Applications are open in the browser — review, submit, and close each tab.")
+        st.caption("This page will keep checking until every tab is closed.")
+        time.sleep(2)
+        st.rerun()
+    else:
+        st.session_state.phase = "resuming"
+        st.rerun()
 
 elif st.session_state.phase == "idle":
     with st.form("search_form"):
         resume_file = st.file_uploader("Resume (PDF)", type=["pdf"])
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             job_role = st.text_input("Job role", placeholder="Software Development Engineer")
         with col2:
             job_location = st.text_input("Location", placeholder="Berlin")
         with col3:
             platform = st.selectbox("Platform", options=["linkedin", "stepstone"], index=0)
-        st.caption("Results are capped at 3 jobs to keep scraping time and LLM costs down for this demo.")
+        with col4:
+            num_jobs = st.number_input("Number of jobs", min_value=1, max_value=10, value=3, step=1)
+
+        st.markdown("**Applicant details** (used later to fill out job application forms)")
+        pcol1, pcol2, pcol3 = st.columns(3)
+        with pcol1:
+            applicant_name = st.text_input("Full name")
+            applicant_phone = st.text_input("Phone", placeholder="optional")
+        with pcol2:
+            applicant_email = st.text_input("Email")
+            applicant_linkedin = st.text_input("LinkedIn URL", placeholder="optional")
+        with pcol3:
+            applicant_work_auth = st.text_input("Work authorization", placeholder="e.g. EU citizen, needs visa")
+            applicant_notice = st.text_input("Notice period", placeholder="optional")
+
         submitted = st.form_submit_button("Find jobs & analyze resume")
 
     if submitted:
-        if not resume_file or not job_role or not job_location:
-            st.error("Please provide a resume PDF, job role, and location.")
+        if not resume_file or not job_role or not job_location or not applicant_name or not applicant_email:
+            st.error("Please provide a resume PDF, job role, location, and at least your name and email.")
         else:
+            st.session_state.applicant_profile = {
+                "name": applicant_name,
+                "email": applicant_email,
+                "phone": applicant_phone,
+                "linkedin_url": applicant_linkedin,
+                "work_authorization": applicant_work_auth,
+                "notice_period": applicant_notice,
+            }
             st.session_state.pending_inputs = {
                 "jobRole": job_role,
                 "jobLocation": job_location,
                 "platform": platform,
+                "numJobs": int(num_jobs),
                 "pdfBase64": base64.b64encode(resume_file.read()).decode("utf-8"),
             }
-            st.session_state.phase = "searching"
+            st.session_state.phase = "starting"
             st.rerun()
 
-if st.session_state.phase in ("reviewing", "done") and st.session_state.job_response:
-    job_response = st.session_state.job_response
-    resume_response = st.session_state.resume_response
+if st.session_state.phase in ("reviewing", "done") and st.session_state.main_response:
+    main_response = st.session_state.main_response
 
     st.subheader("Jobs found")
-    csv_path = job_response.get("pathToJobsCsv")
+    csv_path = main_response.get("pathToJobsCsv")
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
@@ -220,7 +263,7 @@ if st.session_state.phase in ("reviewing", "done") and st.session_state.job_resp
                 )
 
             for r in tailored:
-                apply_flag = str(r.get("apply", "")).strip().lower() == "true"
+                apply_flag = str(r.get("apply_resume_corrections", "")).strip().lower() == "true"
                 status_badge = " ✅ Marked for tailoring" if apply_flag else ""
                 job_key = r["url"]
                 with st.expander(f"{r['title']} — {r['company']}{status_badge}", expanded=True):
@@ -231,21 +274,16 @@ if st.session_state.phase in ("reviewing", "done") and st.session_state.job_resp
                     if st.session_state.phase == "reviewing":
                         approve_col, reject_col = st.columns(2)
                         if approve_col.button("Approve", key=f"approve_{job_key}", type="primary" if not apply_flag else "secondary"):
-                            update_job_row(csv_path, job_key, apply=True)
+                            update_job_row(csv_path, job_key, apply_resume_corrections=True)
                             st.rerun()
                         if reject_col.button("Reject", key=f"reject_{job_key}"):
-                            update_job_row(csv_path, job_key, apply=False)
+                            update_job_row(csv_path, job_key, apply_resume_corrections=False)
                             st.rerun()
 
                     resume_path = r.get("tailored_resume_path")
                     if resume_path and os.path.exists(resume_path):
-                        decision = r.get("decision") or ""
-                        apply_open_col, download_col = st.columns(2)
-                        if apply_open_col.button("Apply", key=f"apply_{job_key}", disabled=(decision == "applied")):
-                            st.session_state.opening_job = {"url": job_key, "csv_path": csv_path}
-                            st.rerun()
                         with open(resume_path, "rb") as rf:
-                            download_col.download_button(
+                            st.download_button(
                                 "Download tailored resume",
                                 data=rf.read(),
                                 file_name=os.path.basename(resume_path),
@@ -260,5 +298,5 @@ if st.session_state.phase in ("reviewing", "done") and st.session_state.job_resp
 
     if st.session_state.phase == "done":
         st.subheader("Agent summary")
-        st.write(resume_response["messages"][-1].content)
+        st.write(main_response["messages"][-1].content)
         st.button("Start a new search", on_click=reset_session)

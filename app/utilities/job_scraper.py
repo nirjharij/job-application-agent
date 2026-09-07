@@ -7,6 +7,8 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+from utilities.jobs_db import is_job_applied
+
 BASE_URL = "https://www.stepstone.de"
 HEADERS = {
     "User-Agent": (
@@ -93,6 +95,8 @@ def scrape_jobs_to_csv(search_url: str, output_csv: str, max_pages: int = 1, lim
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for i, link in enumerate(links, start=1):
+            if is_job_applied(link):
+                continue
             try:
                 job = parse_job_posting(link)
                 if job:

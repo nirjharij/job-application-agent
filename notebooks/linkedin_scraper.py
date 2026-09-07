@@ -6,8 +6,14 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 LINKEDIN_MCP_CONFIG = {
     "mcp-server-linkedin": {
         "transport": "stdio",
-        "command": "uvx",
-        "args": ["mcp-server-linkedin@latest"],
+        "command": "uv",
+        "args": [
+            "run",
+            "--directory",
+            "/Users/nirjharijankar/projects/linkedin-mcp-server-pr727",
+            "-m",
+            "linkedin_mcp_server",
+        ],
         "env": {"UV_HTTP_TIMEOUT": "300"},
     }
 }
