@@ -44,4 +44,13 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff>=0.15.22",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
 ]
+
+[tool.pytest.ini_options]
+# Both roots are required: most modules use `from utilities.x import y` (rooted at app/),
+# but tools/job_search_agent_tools.py uses `from app.config import ...` (rooted at the repo root).
+pythonpath = [".", "app"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

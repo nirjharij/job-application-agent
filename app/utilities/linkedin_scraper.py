@@ -1,8 +1,41 @@
+import asyncio
 import csv
 import json
+import logging
 
 from utilities.jobs_db import is_job_applied
 from utilities.mcp_tools import get_linkedin_mcp_tools
+
+logger = logging.getLogger(__name__)
+
+# Bounds each LinkedIn MCP tool call (stdio subprocess round-trip) so a stalled mcp-server-linkedin
+# process can't hang the search indefinitely.
+MCP_TOOL_TIMEOUT_SECONDS = 30
+MCP_TOOL_MAX_ATTEMPTS = 3
+MCP_TOOL_RETRY_BACKOFF_SECONDS = 2
+
+
+class LinkedInSearchEmptyError(RuntimeError):
+    """Raised when LinkedIn's search_jobs MCP tool returns no job_ids at all for a search
+    (as opposed to a search that found jobs but all of them were already applied to)."""
+
+
+async def _call_mcp_tool(tool, args: dict, *, attempts: int = MCP_TOOL_MAX_ATTEMPTS):
+    """Call an MCP tool's ainvoke, retrying with a short linear backoff on timeout or any other
+    error (a dropped stdio pipe, a transient upstream 5xx, ...) before giving up. Each attempt is
+    itself bounded by MCP_TOOL_TIMEOUT_SECONDS so a hung attempt doesn't just eat the whole budget."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(tool.ainvoke(args), timeout=MCP_TOOL_TIMEOUT_SECONDS)
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "MCP tool %s call failed (attempt %d/%d): %s — retrying",
+                tool.name, attempt, attempts, exc,
+            )
+            await asyncio.sleep(MCP_TOOL_RETRY_BACKOFF_SECONDS * attempt)
+
 
 CSV_FIELDNAMES = [
     "title",
@@ -28,10 +61,27 @@ class LinkedInJobScraper:
         search_jobs = tools_by_name.get("search_jobs")
         get_job_details = tools_by_name.get("get_job_details")
 
-        search_result = self._extract_json(
-            await search_jobs.ainvoke({"keywords": role, "location": location, "max_pages": 1})
-        )
-        job_ids = search_result.get("job_ids", [])[:limit]
+        try:
+            search_result = self._extract_json(
+                await _call_mcp_tool(search_jobs, {"keywords": role, "location": location, "max_pages": 1})
+            )
+        except Exception as exc:
+            logger.error(
+                "LinkedIn search_jobs MCP call failed after %d attempts: role=%r location=%r error=%s",
+                MCP_TOOL_MAX_ATTEMPTS, role, location, exc,
+            )
+            raise LinkedInSearchEmptyError(
+                f"LinkedIn search for role={role!r} location={location!r} failed: {exc}"
+            ) from exc
+
+        job_ids = search_result.get("job_ids", [])
+        if job_ids == []:
+            reason = "search_jobs returned no job_ids"
+            logger.error("LinkedIn search failed: role=%r location=%r reason=%s", role, location, reason)
+            raise LinkedInSearchEmptyError(
+                f"LinkedIn search for role={role!r} location={location!r} returned no jobs ({reason})."
+            )
+        job_ids = job_ids[:limit]
         titles_by_id = {
             ref["url"].strip("/").split("/")[-1]: ref["text"]
             for ref in search_result.get("references", {}).get("search_results", [])
@@ -50,7 +100,9 @@ class LinkedInJobScraper:
                     continue
 
                 try:
-                    details = self._extract_json(await get_job_details.ainvoke({"job_id": job_id}))
+                    details = self._extract_json(
+                        await _call_mcp_tool(get_job_details, {"job_id": job_id})
+                    )
                 except Exception:
                     continue
 

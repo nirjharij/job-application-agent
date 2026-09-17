@@ -1,13 +1,16 @@
+import logging
+
 from dotenv import load_dotenv
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.messages import HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphBubbleUp
 from langgraph.store.postgres import PostgresStore
 from langgraph.types import Command
 
-from config import MODEL
+from config import get_llm
 from dataclasses import dataclass
 from utilities.jobs_db import DB_URI
 from prompts.apply_jobs_agent_prompt import APPLY_JOBS_AGENT_SYSTEM_PROMPT
@@ -23,9 +26,10 @@ from tools.resume_handler_agent_tools import (
     analyze_resume_and_make_suggestions,
     resume_corrections_and_download,
 )
-from utilities.mcp_tools import get_apply_jobs_mcp_tools
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class JobSearchContext:
@@ -71,8 +75,12 @@ async def build_agent():
     store = _store_cm.__enter__()
     store.setup()
 
+    # One shared instance (timeout/retry policy from config.get_llm()) reused across every agent
+    # below, rather than a fresh one per create_agent call.
+    llm = get_llm()
+
     job_search_agent = create_agent(
-        model=MODEL,
+        model=llm,
         system_prompt=JOB_SEARCH_AGENT_SYSTEM_PROMPT,
         tools=[job_finder],
         context_schema=JobSearchContext,
@@ -81,7 +89,7 @@ async def build_agent():
     )
 
     apply_jobs_agent = create_agent(
-        model=MODEL,
+        model=llm,
         system_prompt=APPLY_JOBS_AGENT_SYSTEM_PROMPT,
         tools=[
             start_applying,
@@ -98,7 +106,7 @@ async def build_agent():
     )
 
     resume_handler_agent = create_agent(
-        model=MODEL,
+        model=llm,
         system_prompt=RESUME_HANDLER_AGENT_SYSTEM_PROMPT,
         tools=[analyze_resume_and_make_suggestions, resume_corrections_and_download],
         state_schema=ResumeHandlerAgentState,
@@ -113,13 +121,27 @@ async def build_agent():
     @tool
     async def call_job_search_agent(platform, num_jobs, role, city, runtime: ToolRuntime) -> str:
         """Call the job search subagent to find jobs"""
-        response = await job_search_agent.ainvoke(
-            {
-                "messages": [HumanMessage(content=f"Find {num_jobs} job(s) for {role} in {city} on {platform}")]
-            },
-            context=JobSearchContext(platform=platform, numJobs=num_jobs, role=role, city=city),
-            config=runtime.config,
-        )
+        try:
+            response = await job_search_agent.ainvoke(
+                {
+                    "messages": [HumanMessage(content=f"Find {num_jobs} job(s) for {role} in {city} on {platform}")]
+                },
+                context=JobSearchContext(platform=platform, numJobs=num_jobs, role=role, city=city),
+                config=runtime.config,
+            )
+        except GraphBubbleUp:
+            # A nested interrupt (from job_search_agent's own HITL middleware, if any) must
+            # propagate untouched rather than being swallowed as a failure — see CLAUDE.md's
+            # "Agent graph" section for why this is what makes main_agent's own run pause instead.
+            raise
+        except Exception as exc:
+            logger.exception("job_search_agent failed")
+            return Command(update={
+                "pathToJobsCsv": None,
+                "messages": [ToolMessage(
+                    f"job_search_agent failed: {exc}", tool_call_id=runtime.tool_call_id
+                )],
+            })
         return Command(update={
             "pathToJobsCsv": response.get("pathToJobsCsv"),
             "messages": [ToolMessage(response["messages"][-1].content, tool_call_id=runtime.tool_call_id)],
@@ -129,16 +151,26 @@ async def build_agent():
     async def call_resume_handler_agent(runtime: ToolRuntime) -> str:
         """Call the resume handler subagent to analyze the resume against the jobs found so far and \
 prepare tailored versions."""
-        response = await resume_handler_agent.ainvoke(
-            {
-                "messages": [HumanMessage(
-                    content="Analyze my resume against the job descriptions, then prepare tailored versions."
+        try:
+            response = await resume_handler_agent.ainvoke(
+                {
+                    "messages": [HumanMessage(
+                        content="Analyze my resume against the job descriptions, then prepare tailored versions."
+                    )],
+                    "pdfBase64": runtime.state.get("pdfBase64"),
+                    "pathToJobsCsv": runtime.state.get("pathToJobsCsv"),
+                },
+                config=runtime.config,
+            )
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            logger.exception("resume_handler_agent failed")
+            return Command(update={
+                "messages": [ToolMessage(
+                    f"resume_handler_agent failed: {exc}", tool_call_id=runtime.tool_call_id
                 )],
-                "pdfBase64": runtime.state.get("pdfBase64"),
-                "pathToJobsCsv": runtime.state.get("pathToJobsCsv"),
-            },
-            config=runtime.config,
-        )
+            })
         return Command(update={
             "pathToJobsCsv": response.get("pathToJobsCsv"),
             "messages": [ToolMessage(response["messages"][-1].content, tool_call_id=runtime.tool_call_id)],
@@ -150,20 +182,30 @@ prepare tailored versions."""
         # Same as call_resume_handler_agent above: apply_jobs_agent's own post_job_apply interrupt
         # propagates straight out of this await and pauses main_agent's own run instead — nothing
         # below this line runs until apply_jobs_agent has genuinely finished.
-        response = await apply_jobs_agent.ainvoke(
-            {
-                "messages": [HumanMessage(content="Apply to the jobs in the jobs csv.")],
-                "pathToJobsCsv": runtime.state.get("pathToJobsCsv")
-            },
-            context=JobApplyContext(applicantProfile=runtime.state.get("applicantProfile")),
-            config=runtime.config,
-        )
+        try:
+            response = await apply_jobs_agent.ainvoke(
+                {
+                    "messages": [HumanMessage(content="Apply to the jobs in the jobs csv.")],
+                    "pathToJobsCsv": runtime.state.get("pathToJobsCsv")
+                },
+                context=JobApplyContext(applicantProfile=runtime.state.get("applicantProfile")),
+                config=runtime.config,
+            )
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            logger.exception("apply_jobs_agent failed")
+            return Command(update={
+                "messages": [ToolMessage(
+                    f"apply_jobs_agent failed: {exc}", tool_call_id=runtime.tool_call_id
+                )],
+            })
         return Command(update={
             "messages": [ToolMessage(response["messages"][-1].content, tool_call_id=runtime.tool_call_id)],
         })
 
     main_agent = create_agent(
-        model=MODEL,
+        model=llm,
         state_schema=JobApplicationAgentState,
         tools=[call_job_search_agent, call_resume_handler_agent, call_apply_jobs_agent],
         system_prompt=MAIN_AGENT_SYSTEM_PROMPT,

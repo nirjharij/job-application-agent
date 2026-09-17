@@ -1,14 +1,19 @@
-import csv
+import os
 import re
 
-from langchain.chat_models import init_chat_model
 from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
 
-from config import MODEL
+from config import get_llm
 from prompts.job_filler_agent_prompt import JOB_FILLER_AGENT_SYSTEM_PROMPT
+from utilities.jobs_csv import (
+    JOB_APPLICATION_STATUS_APPLIED,
+    JOB_APPLICATION_STATUS_APPLYING,
+    read_job_rows,
+    update_job_row,
+)
 from utilities.jobs_db import mark_job_applied
-from utilities.mcp_tools import get_apply_jobs_mcp_tools, get_current_apply_jobs_session
+from utilities.mcp_tools import MCPConnectionError, get_apply_jobs_mcp_tools, get_current_apply_jobs_session
 
 # Populated by start_applying, consumed by post_job_apply — within the same apply_jobs_agent run, so
 # module-level state is enough to hand off between them.
@@ -18,19 +23,17 @@ _pending_jobs: list[dict] = []
 _MAX_STEPS_PER_JOB = 40
 
 
-async def _fill_one_job(llm_with_tools, tools_by_name: dict, job: dict, profile_lines: str) -> str:
-    """Drive a single job application to completion via a plain bind_tools() + loop — deliberately
-    not a nested LangGraph create_agent: this never needs interrupting/resuming (the only interrupt
-    anywhere in this system is post_job_apply, in the outer apply_jobs_agent), so a bare tool-calling
-    loop is simpler and avoids nesting LangGraph three levels deep for no benefit. Mirrors
-    resume_handler_agent_tools.py's direct init_chat_model use rather than building another agent
-    object — the difference here is just that this task needs several rounds of tool feedback
-    (open tab, see what's there, click, see what changed, fill...), not one single completion.
+def _mark_applied(csv_path: str | None, url: str) -> None:
+    """Mark a job applied in Postgres (the real dedup source of truth) and, if we know the csv
+    path, flip its job_application_status to "applied" too — this second write is what lets a
+    restarted run detect and finish a job that was left mid-"applying" by a crash."""
+    mark_job_applied(url)
+    if csv_path:
+        update_job_row(csv_path, url, job_application_status=JOB_APPLICATION_STATUS_APPLIED)
 
-    Each call gets a brand-new, job-scoped message history — nothing from any other job is ever in
-    context — which is what actually fixes the earlier tab-reopening bug: there is no multi-job
-    conversation left to lose track of.
-    """
+
+async def _fill_one_job(llm_with_tools, tools_by_name: dict, job: dict, profile_lines: str) -> str:
+    """Drive a single job application to completion via a plain bind_tools() + loop"""
     messages = [
         SystemMessage(content=JOB_FILLER_AGENT_SYSTEM_PROMPT),
         HumanMessage(content=(
@@ -64,8 +67,15 @@ async def start_applying(runtime: ToolRuntime) -> str:
     if not csv_path:
         return ToolMessage("No jobs csv path found in state.", tool_call_id=runtime.tool_call_id)
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    # Sanity check: a previous run may have crashed (or the app was restarted) while a job's
+    # browser fill was in progress — that job's status is still "applying" in the csv even though
+    # Postgres never heard about it. Finalize any such leftovers before starting fresh.
+    if os.path.exists(csv_path):
+        for row in read_job_rows(csv_path):
+            if row.get("job_application_status") == JOB_APPLICATION_STATUS_APPLYING:
+                _mark_applied(csv_path, row["url"])
+
+    rows = read_job_rows(csv_path)
 
     _pending_jobs = rows
 
@@ -75,15 +85,19 @@ async def start_applying(runtime: ToolRuntime) -> str:
     profile = runtime.context.applicantProfile or {}
     profile_lines = "\n".join(f"- {k}: {v}" for k, v in profile.items() if v) or "(none provided)"
 
-    tools = await get_apply_jobs_mcp_tools()
+    try:
+        tools = await get_apply_jobs_mcp_tools()
+    except MCPConnectionError as e:
+        return ToolMessage(f"Could not start applying: {e}", tool_call_id=runtime.tool_call_id)
     tools_by_name = {t.name: t for t in tools}
-    llm_with_tools = init_chat_model(MODEL).bind_tools(tools)
+    llm_with_tools = get_llm().bind_tools(tools)
 
     # Sequential, not asyncio.gather: every job shares the same underlying browser, which only ever
     # has one "current" tab — running jobs concurrently would race on that shared focus state (unlike
     # resume_handler_agent_tools.py's parallel LLM calls, which touch no shared browser state).
     results = []
     for job in _pending_jobs:
+        update_job_row(csv_path, job["url"], job_application_status=JOB_APPLICATION_STATUS_APPLYING)
         try:
             summary = await _fill_one_job(llm_with_tools, tools_by_name, job, profile_lines)
         except Exception as e:
@@ -123,8 +137,9 @@ async def post_job_apply(runtime: ToolRuntime) -> str:
     if not jobs:
         return ToolMessage("No pending applications to mark as applied.", tool_call_id=runtime.tool_call_id)
 
+    csv_path = runtime.state.get("pathToJobsCsv")
     for job in jobs:
-        mark_job_applied(job["url"])
+        _mark_applied(csv_path, job["url"])
 
     return ToolMessage(
         f"{len(jobs)} application(s) marked as applied.",

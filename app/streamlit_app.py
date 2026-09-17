@@ -12,6 +12,15 @@ from langgraph.types import Command
 
 from agent import build_agent
 from tools.apply_jobs_agent_tools import pending_tabs_open
+from utilities.jobs_csv import update_job_row
+from utilities.validation import (
+    _validate_email,
+    _validate_job_text,
+    _validate_linkedin_url,
+    _validate_name,
+    _validate_optional_text,
+    _validate_resume,
+)
 
 st.set_page_config(page_title="Job Application Agent", layout="wide")
 
@@ -31,9 +40,6 @@ def run(coro):
     try:
         return get_event_loop().run_until_complete(coro)
     except BaseException:
-        # Streamlit's own error display truncates some tracebacks (e.g. uvloop's Cython frames
-        # don't preserve the full Python call chain) — log the complete one to disk so a crash can
-        # actually be diagnosed, without changing what the user sees in the UI.
         with open("error.log", "a", encoding="utf-8") as f:
             f.write(f"\n{'=' * 80}\n{time.strftime('%Y-%m-%d %H:%M:%S')} phase={st.session_state.get('phase')}\n")
             traceback.print_exc(file=f)
@@ -70,28 +76,6 @@ def reset_session():
     st.session_state.main_response = None
     st.session_state.pending_inputs = None
     st.session_state.applicant_profile = None
-
-
-def update_job_row(csv_path: str, job_url: str, **updates) -> None:
-    """Persist arbitrary per-job fields (apply, tailored_resume_path, ...) back into the jobs csv."""
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        fieldnames = list(reader.fieldnames)
-        for key in updates:
-            if key not in fieldnames:
-                fieldnames.append(key)
-
-    for row in rows:
-        for key in updates:
-            row.setdefault(key, "")
-        if row["url"] == job_url:
-            row.update(updates)
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def advance_phase(response) -> str:
@@ -212,8 +196,19 @@ elif st.session_state.phase == "idle":
         submitted = st.form_submit_button("Find jobs & analyze resume")
 
     if submitted:
-        if not resume_file or not job_role or not job_location or not applicant_name or not applicant_email:
-            st.error("Please provide a resume PDF, job role, location, and at least your name and email.")
+        validation_error = (
+            _validate_resume(resume_file)
+            or _validate_job_text(job_role, "Job role")
+            or _validate_job_text(job_location, "Location")
+            or _validate_name(applicant_name)
+            or _validate_email(applicant_email)
+            or _validate_optional_text(applicant_phone, max_len=30)
+            or _validate_linkedin_url(applicant_linkedin)
+            or _validate_optional_text(applicant_work_auth)
+            or _validate_optional_text(applicant_notice)
+        )
+        if validation_error:
+            st.error(validation_error)
         else:
             st.session_state.applicant_profile = {
                 "name": applicant_name,

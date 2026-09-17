@@ -6,12 +6,11 @@ from collections import Counter
 
 import fitz  # PyMuPDF
 from fpdf import FPDF
-from langchain.chat_models import init_chat_model
 from langchain.messages import HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command
 
-from config import MODEL
+from config import OUTPUT_DIRECTORY, get_llm
 
 # fpdf2's core fonts only support latin-1 — LLM output commonly includes smart quotes, en/em
 # dashes, ellipses, and bullets that aren't in that range, so they're transliterated to ASCII
@@ -184,7 +183,7 @@ async def analyze_resume_and_make_suggestions(runtime: ToolRuntime) -> str:
         rows = list(reader)
         fieldnames = reader.fieldnames + ["resume_corrections"] + ["apply_resume_corrections"]
 
-    llm = init_chat_model(MODEL)
+    llm = get_llm()
 
     async def get_suggestions(row):
         message = HumanMessage(
@@ -253,11 +252,11 @@ async def generate_tailored_resume_for_row(pdf_base64: str, row: dict) -> str:
             },
         ]
     )
-    llm = init_chat_model(MODEL)
+    llm = get_llm()
     response = await llm.ainvoke([message])
 
-    filename = f"{row['company']}_{row['title']}_tailored_resume.pdf".replace(" ", "_").replace("/", "-")
-    filepath = os.path.join(os.getcwd(), filename)
+    filename = f"{row['company']}_{row['title']}_resume.pdf".replace(" ", "_").replace("/", "-")
+    filepath = os.path.join(OUTPUT_DIRECTORY, filename)
     style = _extract_style_profile(pdf_base64)
     _write_resume_pdf(response.content, filepath, style)
     return filepath
