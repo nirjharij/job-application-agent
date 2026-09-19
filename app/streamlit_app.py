@@ -268,10 +268,10 @@ if st.session_state.phase in ("reviewing", "done") and st.session_state.main_res
 
                     if st.session_state.phase == "reviewing":
                         approve_col, reject_col = st.columns(2)
-                        if approve_col.button("Approve", key=f"approve_{job_key}", type="primary" if not apply_flag else "secondary"):
+                        if approve_col.button("Approve", key=f"approve_{job_key}", type="primary" if apply_flag else "secondary"):
                             update_job_row(csv_path, job_key, apply_resume_corrections=True)
                             st.rerun()
-                        if reject_col.button("Reject", key=f"reject_{job_key}"):
+                        if reject_col.button("Reject", key=f"reject_{job_key}", type="secondary" if apply_flag else "primary"):
                             update_job_row(csv_path, job_key, apply_resume_corrections=False)
                             st.rerun()
 

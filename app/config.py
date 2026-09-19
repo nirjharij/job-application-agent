@@ -2,7 +2,7 @@ import os
 
 from langchain.chat_models import init_chat_model
 
-from utilities.linkedin_session import STORAGE_STATE_PATH
+from utilities.linkedin.linkedin_session import STORAGE_STATE_PATH
 
 CSV_FILENAME = "job_details.csv"
 MODEL = "gpt-5-nano"

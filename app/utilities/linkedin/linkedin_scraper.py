@@ -1,41 +1,12 @@
-import asyncio
 import csv
 import json
 import logging
 
 from utilities.jobs_db import is_job_applied
-from utilities.mcp_tools import get_linkedin_mcp_tools
+from utilities.mcp_tools import MCP_TOOL_MAX_ATTEMPTS, _call_mcp_tool, get_linkedin_mcp_tools
+from utilities.linkedin.custom_exception import LinkedInSearchEmptyError
 
 logger = logging.getLogger(__name__)
-
-# Bounds each LinkedIn MCP tool call (stdio subprocess round-trip) so a stalled mcp-server-linkedin
-# process can't hang the search indefinitely.
-MCP_TOOL_TIMEOUT_SECONDS = 30
-MCP_TOOL_MAX_ATTEMPTS = 3
-MCP_TOOL_RETRY_BACKOFF_SECONDS = 2
-
-
-class LinkedInSearchEmptyError(RuntimeError):
-    """Raised when LinkedIn's search_jobs MCP tool returns no job_ids at all for a search
-    (as opposed to a search that found jobs but all of them were already applied to)."""
-
-
-async def _call_mcp_tool(tool, args: dict, *, attempts: int = MCP_TOOL_MAX_ATTEMPTS):
-    """Call an MCP tool's ainvoke, retrying with a short linear backoff on timeout or any other
-    error (a dropped stdio pipe, a transient upstream 5xx, ...) before giving up. Each attempt is
-    itself bounded by MCP_TOOL_TIMEOUT_SECONDS so a hung attempt doesn't just eat the whole budget."""
-    for attempt in range(1, attempts + 1):
-        try:
-            return await asyncio.wait_for(tool.ainvoke(args), timeout=MCP_TOOL_TIMEOUT_SECONDS)
-        except Exception as exc:
-            if attempt == attempts:
-                raise
-            logger.warning(
-                "MCP tool %s call failed (attempt %d/%d): %s — retrying",
-                tool.name, attempt, attempts, exc,
-            )
-            await asyncio.sleep(MCP_TOOL_RETRY_BACKOFF_SECONDS * attempt)
-
 
 CSV_FIELDNAMES = [
     "title",

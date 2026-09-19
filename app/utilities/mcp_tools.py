@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -12,6 +13,31 @@ class MCPConnectionError(RuntimeError):
     """Raised when establishing an MCP server connection (subprocess launch + handshake) fails —
     e.g. the server command isn't installed, its startup path is wrong, or it crashes before the
     initial handshake completes."""
+
+
+# Bounds each MCP tool call (stdio subprocess round-trip) so a stalled MCP server process can't
+# hang the caller indefinitely.
+MCP_TOOL_TIMEOUT_SECONDS = 30
+MCP_TOOL_MAX_ATTEMPTS = 3
+MCP_TOOL_RETRY_BACKOFF_SECONDS = 2
+
+
+async def _call_mcp_tool(tool, args: dict, *, attempts: int = MCP_TOOL_MAX_ATTEMPTS):
+    """Call an MCP tool's ainvoke, retrying with a short linear backoff on timeout or any other
+    error (a dropped stdio pipe, a transient upstream 5xx, ...) before giving up. Each attempt is
+    itself bounded by MCP_TOOL_TIMEOUT_SECONDS so a hung attempt doesn't just eat the whole budget."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(tool.ainvoke(args), timeout=MCP_TOOL_TIMEOUT_SECONDS)
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "MCP tool %s call failed (attempt %d/%d): %s — retrying",
+                tool.name, attempt, attempts, exc,
+            )
+            await asyncio.sleep(MCP_TOOL_RETRY_BACKOFF_SECONDS * attempt)
+
 
 # needed so that it is not garbage collected
 _mcp_session_cm = None

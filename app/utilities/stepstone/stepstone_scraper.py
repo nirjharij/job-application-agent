@@ -1,9 +1,11 @@
 import csv
 import json
+import logging
 import re
 import time
+from json import JSONDecodeError
 from urllib.parse import urljoin
-
+from utilities.stepstone.custom_exception import StepStoneJobParsingError
 import requests
 from bs4 import BeautifulSoup
 
@@ -18,6 +20,7 @@ HEADERS = {
     )
 }
 
+logger = logging.getLogger(__name__)
 
 def _get(url: str, timeout: int = 15) -> requests.Response:
     response = requests.get(url, headers=HEADERS, timeout=timeout)
@@ -41,38 +44,40 @@ def get_job_links(search_url: str, max_pages: int = 1, limit: int | None = None)
             if limit is not None and len(links) >= limit:
                 return links
         time.sleep(1)
+    logger.error("Failed to collect job links for search: %s", search_url)
     return links
 
 
 def parse_job_posting(url: str) -> dict:
     """Fetch a job detail page and extract structured JobPosting data."""
-    soup = BeautifulSoup(_get(url).text, "html.parser")
-    script = soup.find("script", type="application/ld+json", string=re.compile("JobPosting"))
-    if not script:
-        return {}
-
-    data = json.loads(script.string)
-    address = data.get("jobLocation", {}).get("address", {})
-    salary = data.get("baseSalary", {}).get("value", {}) if data.get("baseSalary") else {}
-    description_html = data.get("description", "")
-    description_text = BeautifulSoup(description_html, "html.parser").get_text(
-        separator="\n", strip=True
-    )
-
-    return {
-        "title": data.get("title"),
-        "company": data.get("hiringOrganization", {}).get("name"),
-        "location": ", ".join(
-            filter(None, [address.get("addressLocality"), address.get("addressRegion")])
-        ),
-        "employment_type": data.get("employmentType"),
-        "date_posted": data.get("datePosted"),
-        "salary_min": salary.get("minValue"),
-        "salary_max": salary.get("maxValue"),
-        "salary_currency": data.get("baseSalary", {}).get("currency"),
-        "description": description_text,
-        "url": url,
-    }
+    try:
+        soup = BeautifulSoup(_get(url).text, "html.parser")
+        script = soup.find("script", type="application/ld+json", string=re.compile("JobPosting"))
+        if not script:
+            return {}
+        data = json.loads(script.string)
+        address = data.get("jobLocation", {}).get("address", {})
+        salary = data.get("baseSalary", {}).get("value", {}) if data.get("baseSalary") else {}
+        description_html = data.get("description", "")
+        description_text = BeautifulSoup(description_html, "html.parser").get_text(
+            separator="\n", strip=True)
+        return {
+            "title": data.get("title"),
+            "company": data.get("hiringOrganization", {}).get("name"),
+            "location": ", ".join(
+                filter(None, [address.get("addressLocality"), address.get("addressRegion")])
+            ),
+            "employment_type": data.get("employmentType"),
+            "date_posted": data.get("datePosted"),
+            "salary_min": salary.get("minValue"),
+            "salary_max": salary.get("maxValue"),
+            "salary_currency": data.get("baseSalary", {}).get("currency"),
+            "description": description_text,
+            "url": url,
+        }
+    except (JSONDecodeError, AttributeError, TypeError) as e:
+        logger.error("Failed to parse job posting %s: %s", url, e)
+        raise StepStoneJobParsingError(f"Failed to parse job posting {url}: {e}") from e
 
 
 def scrape_jobs_to_csv(search_url: str, output_csv: str, max_pages: int = 1, limit: int | None = None) -> None:
@@ -101,6 +106,6 @@ def scrape_jobs_to_csv(search_url: str, output_csv: str, max_pages: int = 1, lim
                 job = parse_job_posting(link)
                 if job:
                     writer.writerow(job)
-            except requests.RequestException:
-                pass
+            except (requests.RequestException, StepStoneJobParsingError) as e:
+                logger.error("Error while parsing job posting for link=%s due to : %s", link, e, exc_info=True)
             time.sleep(1)

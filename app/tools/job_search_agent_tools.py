@@ -1,13 +1,16 @@
+import logging
 import os
 
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command
 from config import OUTPUT_DIRECTORY, CSV_FILENAME
-from utilities.job_scraper import scrape_jobs_to_csv
-from utilities.linkedin_scraper import LinkedInSearchEmptyError, scrape_linkedin_jobs_to_csv
+from utilities.stepstone.stepstone_scraper import scrape_jobs_to_csv
+from utilities.linkedin.linkedin_scraper import LinkedInSearchEmptyError, scrape_linkedin_jobs_to_csv
 from utilities.mcp_tools import MCPConnectionError
+from utilities.stepstone.custom_exception import StepStoneJobParsingError
 
+logger = logging.getLogger(__name__)
 
 @tool
 async def job_finder(runtime: ToolRuntime, platform: str, role: str, city: str, radius: int = 30) -> str:
@@ -17,21 +20,31 @@ async def job_finder(runtime: ToolRuntime, platform: str, role: str, city: str, 
     limit = runtime.state.get("numJobs") or 3
 
     if platform.lower() == "stepstone":
-        scrape_jobs_to_csv(
-            f"https://www.stepstone.de/work/{role.strip()}/in-{city.lower()}?radius={radius}",
-            csv_path,
-            limit=limit,  # utilities/job_scraper.py's scrape_jobs_to_csv takes `limit`, not `max_jobs`
-        )
+        try:
+            scrape_jobs_to_csv(
+                f"https://www.stepstone.de/work/{role.strip()}/in-{city.lower()}?radius={radius}",
+                csv_path,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.exception("Failed to scrape jobs from StepStone for role=%s, location=%s", role, city)
+            return Command(update={
+                "pathToJobsCsv": None,
+                "messages": [ToolMessage(
+                    f"StepStone search failed for role={role!r} city={city!r}: {e}",
+                    tool_call_id=runtime.tool_call_id,
+                )],
+            })
+
     else:
         try:
             await scrape_linkedin_jobs_to_csv(role, city, csv_path, limit=limit)
         except (LinkedInSearchEmptyError, MCPConnectionError) as e:
-            # Explicitly null out pathToJobsCsv rather than leaving it untouched, since on a retry
-            # within the same thread a prior successful search would otherwise leave main_agent's
-            # state pointing at stale csv data instead of surfacing this failure.
+            logger.exception("Failed to scrape job from LinkedIn for role=%s, location=%s", role, city)
             return Command(update={
                 "pathToJobsCsv": None,
-                "messages": [ToolMessage(str(e), tool_call_id=runtime.tool_call_id)],
+                "messages": [ToolMessage(f"LinkedIn search failed for role={role!r} location={city!r}: {e}",
+                                         tool_call_id=runtime.tool_call_id)],
             })
 
     return Command(update={

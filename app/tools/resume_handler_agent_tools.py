@@ -108,6 +108,22 @@ def _extract_style_profile(pdf_base64: str) -> dict:
     }
 
 
+def _extract_resume_text(pdf_base64: str) -> str:
+    """Extract the original resume's plain text (first page, matching _extract_style_profile's
+    single-page assumption) so a rejected job's resume file can still be produced with the
+    unmodified original content, with no LLM call."""
+    try:
+        doc = fitz.open(stream=base64.b64decode(pdf_base64), filetype="pdf")
+    except Exception:
+        return ""
+    if doc.page_count == 0:
+        doc.close()
+        return ""
+    text = doc[0].get_text("text")
+    doc.close()
+    return text
+
+
 def _classify_resume_line(stripped: str, is_first_nonempty: bool) -> str:
     if is_first_nonempty:
         return "name"
@@ -154,21 +170,9 @@ def _write_resume_pdf(text: str, filepath: str, style: dict) -> None:
         pdf.set_text_color(*color)
         if kind == "bullet":
             pdf.set_x(pdf.l_margin + 5)
-        # multi_cell defaults to leaving the cursor at the right margin (new_x=XPos.RIGHT),
-        # which starves every subsequent call of horizontal space — reset it back to the
-        # left margin after each line instead.
+
         pdf.multi_cell(0, round(size * 0.6, 1), stripped, align=align, new_x="LMARGIN", new_y="NEXT")
     pdf.output(filepath)
-
-
-# NOTE (adapted per confirmed decision): `apply` defaults to False, not True — resume_corrections_and_download
-# is gated by HumanInTheLoopMiddleware (see resume_handler_agent in agent.py), pausing before it runs at all.
-# While paused, the Streamlit UI lets the user flip each row's `apply` True/False directly in the csv (no
-# agent involvement); a single "Continue" action then always resumes with {"type": "approve"} regardless of
-# what was picked — the interrupt exists so the human can review suggestions before generation, not to gate
-# individual rows through the HITL decision itself. resume_corrections_and_download then processes whichever
-# rows are apply=True at that point, exactly as originally written.
-
 
 @tool
 async def analyze_resume_and_make_suggestions(runtime: ToolRuntime) -> str:
@@ -225,47 +229,54 @@ async def analyze_resume_and_make_suggestions(runtime: ToolRuntime) -> str:
 
 
 async def generate_tailored_resume_for_row(pdf_base64: str, row: dict) -> str:
-    """Generate one tailored resume file for a single job row (never overwrites the original resume).
+    """Generate one resume file for a single job row (never overwrites the original resume).
 
-    Extracted from resume_corrections_and_download so it can be called for a single approved job
-    (from the Streamlit Approve button) as well as in a full-csv batch (from the tool below).
+    If the job's suggestions were approved (apply_resume_corrections == "true"), the resume is
+    rewritten by the LLM per those suggestions; otherwise the original resume's text is used
+    unchanged, with no LLM call. Extracted from resume_corrections_and_download so it can be
+    called per row in a full-csv batch (from the tool below).
     """
-    message = HumanMessage(
-        content=[
-            {
-                "type": "text",
-                "text": (
-                    "Rewrite the attached resume, applying the suggested corrections below. "
-                    "Do not invent new experience or skills — only reorganize, rephrase, and "
-                    "emphasize what is already in the original resume, per the suggestions. "
-                    "Output only the complete rewritten resume text, ready to save as the final "
-                    "document. Do not include any commentary, notes, explanations, or disclaimers "
-                    "of any kind, before the resume, after it, or appended as a closing section — "
-                    "the output must contain nothing but the resume itself.\n\n"
-                    f"Suggested changes:\n{row['resume_corrections']}\n"
-                ),
-            },
-            {
-                "type": "file",
-                "mime_type": "application/pdf",
-                "base64": pdf_base64,
-            },
-        ]
-    )
-    llm = get_llm()
-    response = await llm.ainvoke([message])
+    if row.get("apply_resume_corrections", "").strip().lower() == "true":
+        message = HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": (
+                        "Rewrite the attached resume, applying the suggested corrections below. "
+                        "Do not invent new experience or skills — only reorganize, rephrase, and "
+                        "emphasize what is already in the original resume, per the suggestions. "
+                        "Output only the complete rewritten resume text, ready to save as the final "
+                        "document. Do not include any commentary, notes, explanations, or disclaimers "
+                        "of any kind, before the resume, after it, or appended as a closing section — "
+                        "the output must contain nothing but the resume itself.\n\n"
+                        f"Suggested changes:\n{row['resume_corrections']}\n"
+                    ),
+                },
+                {
+                    "type": "file",
+                    "mime_type": "application/pdf",
+                    "base64": pdf_base64,
+                },
+            ]
+        )
+        llm = get_llm()
+        response = await llm.ainvoke([message])
+        text = response.content
+    else:
+        text = _extract_resume_text(pdf_base64)
 
     filename = f"{row['company']}_{row['title']}_resume.pdf".replace(" ", "_").replace("/", "-")
     filepath = os.path.join(OUTPUT_DIRECTORY, filename)
     style = _extract_style_profile(pdf_base64)
-    _write_resume_pdf(response.content, filepath, style)
+    _write_resume_pdf(text, filepath, style)
     return filepath
 
 
 @tool
 async def resume_corrections_and_download(runtime: ToolRuntime) -> str:
-    """Apply the suggested resume corrections and save each tailored resume as a new file \
-        (never overwriting the original), one per job marked apply_resume_corrections=True in the jobs csv."""
+    """Save a resume file for every job in the jobs csv (never overwriting the original): the \
+        LLM-tailored rewrite for jobs marked apply_resume_corrections=True, and the original \
+        resume's unchanged text for the rest."""
     csv_path = runtime.state.get("pathToJobsCsv")
     pdf_base64 = runtime.state.get("pdfBase64")
     if not csv_path or not pdf_base64:
@@ -280,8 +291,6 @@ async def resume_corrections_and_download(runtime: ToolRuntime) -> str:
 
     async def apply_suggestions(row):
         row.setdefault("tailored_resume_path", "")
-        if row.get("apply_resume_corrections", "").strip().lower() != "true":
-            return
         filepath = await generate_tailored_resume_for_row(pdf_base64, row)
         row["tailored_resume_path"] = filepath
         saved_files.append(filepath)
