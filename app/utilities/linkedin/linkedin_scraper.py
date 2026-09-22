@@ -94,15 +94,14 @@ class LinkedInJobScraper:
                 })
 
     def _extract_json(self, mcp_result) -> dict:
-        """MCP tool results come back as a list of content blocks; the payload is JSON text in the first one."""
+        """ MCP tool results come back as a list of content blocks; the payload is JSON text in the first one."""
         return json.loads(mcp_result[0]["text"])
 
-
     def _parse_job_posting_text(self, text: str) -> tuple[str, str, str]:
-        """Best-effort split of LinkedIn's unstructured job posting text into (company, location, description).
+        """ Best-effort split of LinkedIn's unstructured job posting text into (company, location, description).
 
-        LinkedIn exposes no structured job schema (unlike StepStone's JobPosting JSON-LD), so this relies on
-        the page's typical text layout: company name on the first line, then title, then a
+        LinkedIn exposes no structured job schema, so this relies on the page's typical text layout: \
+        company name on the first line, then title, then a
         "location · posted-time · applicants" line, then the full description after "About the job".
         """
         lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -117,13 +116,12 @@ class LinkedInJobScraper:
         description = text.split("About the job", 1)[1].strip() if "About the job" in text else text
         return company, location, description
 
-
     def linkedin_tool_messages_to_csv(self, messages, output_csv: str, location: str = "") -> int:
-        """Consolidate raw search_jobs/get_job_details ToolMessage results already present in the \
-    conversation into a jobs csv, matching the same schema as the StepStone scraper.
+        """ Consolidate raw search_jobs/get_job_details ToolMessage results already present in the \
+            conversation into a jobs csv, matching the standard jobs csv schema.
 
-        Use this when the LLM called LinkedIn's MCP tools directly (via dynamic tool selection) \
-    instead of going through scrape_linkedin_jobs_to_csv. Returns the number of rows written.
+            Use this when the LLM called LinkedIn's MCP tools directly (via dynamic tool selection) \
+            instead of going through scrape_linkedin_jobs_to_csv. Returns the number of rows written.
         """
         titles_by_id: dict[str, str] = {}
         job_details: dict[str, dict] = {}

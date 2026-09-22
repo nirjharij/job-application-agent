@@ -8,12 +8,10 @@ from config import LINKEDIN_MCP_CONFIG, PLAYWRIGHT_MCP_CONFIG
 
 logger = logging.getLogger(__name__)
 
-
 class MCPConnectionError(RuntimeError):
     """Raised when establishing an MCP server connection (subprocess launch + handshake) fails —
     e.g. the server command isn't installed, its startup path is wrong, or it crashes before the
     initial handshake completes."""
-
 
 # Bounds each MCP tool call (stdio subprocess round-trip) so a stalled MCP server process can't
 # hang the caller indefinitely.
@@ -21,6 +19,11 @@ MCP_TOOL_TIMEOUT_SECONDS = 30
 MCP_TOOL_MAX_ATTEMPTS = 3
 MCP_TOOL_RETRY_BACKOFF_SECONDS = 2
 
+_linkedin_client = None
+_linkedin_tools = None
+# needed so that it is not garbage collected
+_mcp_session_cm = None
+_mcp_session = None
 
 async def _call_mcp_tool(tool, args: dict, *, attempts: int = MCP_TOOL_MAX_ATTEMPTS):
     """Call an MCP tool's ainvoke, retrying with a short linear backoff on timeout or any other
@@ -37,12 +40,6 @@ async def _call_mcp_tool(tool, args: dict, *, attempts: int = MCP_TOOL_MAX_ATTEM
                 tool.name, attempt, attempts, exc,
             )
             await asyncio.sleep(MCP_TOOL_RETRY_BACKOFF_SECONDS * attempt)
-
-
-# needed so that it is not garbage collected
-_mcp_session_cm = None
-_mcp_session = None
-
 
 async def get_apply_jobs_mcp_tools() -> list:
     """Launch the shared Playwright MCP session (first call only) and return its tools, minus
@@ -66,17 +63,11 @@ async def get_apply_jobs_mcp_tools() -> list:
     tools = await load_mcp_tools(_mcp_session)
     return [t for t in tools if t.name != "browser_close"]
 
-
 def get_current_apply_jobs_session():
     """The shared Playwright MCP session if it's been launched already, else None — a bare read,
     never triggers get_apply_jobs_mcp_tools()'s lazy launch. Used by pending_tabs_open() to poll
     open tabs without forcing the shared browser to start just to answer "is anything open"."""
     return _mcp_session
-
-
-_linkedin_client = None
-_linkedin_tools = None
-
 
 async def get_linkedin_mcp_tools() -> list:
     """Fetch the LinkedIn MCP server's tools once (first call only) and cache them, so every scrape

@@ -33,23 +33,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class JobSearchContext:
-    platform: str
     numJobs: int
     role: str
     city: str
 
-@dataclass
-class JobApplyContext:
-    applicantProfile: dict
-
 class JobApplicationAgentState(AgentState):
     pathToJobsCsv: str
     pdfBase64: str
-    applicantProfile: dict
 
 class JobSearchAgentState(AgentState):
     pathToJobsCsv: str
-    platform: str
     numJobs: int
 
 class ResumeHandlerAgentState(AgentState):
@@ -57,14 +50,12 @@ class ResumeHandlerAgentState(AgentState):
     pdfBase64: str
     tailoredResumeFiles: list
 
-
 class ApplyJobsAgentState(AgentState):
     pathToJobsCsv: str
-
+    pdfBase64: str
 
 _store_cm = None  # holds a reference to the entered context manager below so it isn't garbage
                   # collected (which would close its connection) once build_agent() returns.
-
 
 async def build_agent():
     """Build the full 3-agent system: main_agent delegates to job_search_agent and resume_handler_agent
@@ -95,7 +86,6 @@ async def build_agent():
             start_applying,
             post_job_apply,
         ],
-        context_schema=JobApplyContext,
         state_schema=ApplyJobsAgentState,
         checkpointer=True,
         middleware=[
@@ -119,20 +109,17 @@ async def build_agent():
     )
 
     @tool
-    async def call_job_search_agent(platform, num_jobs, role, city, runtime: ToolRuntime) -> str:
-        """Call the job search subagent to find jobs"""
+    async def call_job_search_agent(role, city, runtime: ToolRuntime, num_jobs: int = 3) -> str:
+        """Call the job search subagent to find jobs on LinkedIn"""
         try:
             response = await job_search_agent.ainvoke(
                 {
-                    "messages": [HumanMessage(content=f"Find {num_jobs} job(s) for {role} in {city} on {platform}")]
+                    "messages": [HumanMessage(content=f"Find {num_jobs} job(s) for {role} in {city}")]
                 },
-                context=JobSearchContext(platform=platform, numJobs=num_jobs, role=role, city=city),
+                context=JobSearchContext(numJobs=num_jobs, role=role, city=city),
                 config=runtime.config,
             )
         except GraphBubbleUp:
-            # A nested interrupt (from job_search_agent's own HITL middleware, if any) must
-            # propagate untouched rather than being swallowed as a failure — see CLAUDE.md's
-            # "Agent graph" section for why this is what makes main_agent's own run pause instead.
             raise
         except Exception as exc:
             logger.exception("job_search_agent failed")
@@ -186,9 +173,9 @@ prepare tailored versions."""
             response = await apply_jobs_agent.ainvoke(
                 {
                     "messages": [HumanMessage(content="Apply to the jobs in the jobs csv.")],
-                    "pathToJobsCsv": runtime.state.get("pathToJobsCsv")
+                    "pathToJobsCsv": runtime.state.get("pathToJobsCsv"),
+                    "pdfBase64": runtime.state.get("pdfBase64"),
                 },
-                context=JobApplyContext(applicantProfile=runtime.state.get("applicantProfile")),
                 config=runtime.config,
             )
         except GraphBubbleUp:

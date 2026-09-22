@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import csv
+import logging
 import os
 from collections import Counter
 
@@ -12,6 +13,7 @@ from langgraph.types import Command
 
 from config import OUTPUT_DIRECTORY, get_llm
 
+logger = logging.getLogger(__name__)
 # fpdf2's core fonts only support latin-1 — LLM output commonly includes smart quotes, en/em
 # dashes, ellipses, and bullets that aren't in that range, so they're transliterated to ASCII
 # before rendering rather than crashing or silently mangling the PDF.
@@ -34,6 +36,8 @@ _DEFAULT_STYLE = {
 _BOLD_FLAG = 1 << 4
 _SERIF_FLAG = 1 << 2
 
+ORIGINAL_RESUME_FILE_NAME = "resume.pdf"
+ORIGINAL_RESUME_FILE_PATH = os.path.join(OUTPUT_DIRECTORY, "resume.pdf")
 
 def _extract_style_profile(pdf_base64: str) -> dict:
     """Inspect the original resume's own PDF (font sizes, bold headers, serif/sans family, an
@@ -107,7 +111,6 @@ def _extract_style_profile(pdf_base64: str) -> dict:
         "name_centered": name_centered,
     }
 
-
 def _extract_resume_text(pdf_base64: str) -> str:
     """Extract the original resume's plain text (first page, matching _extract_style_profile's
     single-page assumption) so a rejected job's resume file can still be produced with the
@@ -123,7 +126,6 @@ def _extract_resume_text(pdf_base64: str) -> str:
     doc.close()
     return text
 
-
 def _classify_resume_line(stripped: str, is_first_nonempty: bool) -> str:
     if is_first_nonempty:
         return "name"
@@ -133,8 +135,11 @@ def _classify_resume_line(stripped: str, is_first_nonempty: bool) -> str:
         return "header"
     return "body"
 
+def _write_resume_pdf(text: str, row: dict, pdf_base64: str) -> str:
+    filename = f"{row['company']}_{row['title']}_resume.pdf".replace(" ", "_").replace("/", "-")
+    filepath = os.path.join(OUTPUT_DIRECTORY, filename)
+    style = _extract_style_profile(pdf_base64)
 
-def _write_resume_pdf(text: str, filepath: str, style: dict) -> None:
     for char, replacement in _PDF_CHAR_REPLACEMENTS.items():
         text = text.replace(char, replacement)
     text = text.encode("latin-1", errors="replace").decode("latin-1")
@@ -173,6 +178,7 @@ def _write_resume_pdf(text: str, filepath: str, style: dict) -> None:
 
         pdf.multi_cell(0, round(size * 0.6, 1), stripped, align=align, new_x="LMARGIN", new_y="NEXT")
     pdf.output(filepath)
+    return filepath
 
 @tool
 async def analyze_resume_and_make_suggestions(runtime: ToolRuntime) -> str:
@@ -210,9 +216,14 @@ async def analyze_resume_and_make_suggestions(runtime: ToolRuntime) -> str:
                 },
             ]
         )
-        response = await llm.ainvoke([message])
-        row["resume_corrections"] = response.content.replace("\n", " | ")
-        row["apply_resume_corrections"] = False
+        try:
+            response = await llm.ainvoke([message])
+            row["resume_corrections"] = response.content.replace("\n", " | ")
+        except Exception as e:
+            logger.exception("Failed to get resume corrections for Job Title=%s, Company=%s & Location=%s,"
+                             " due to: %s", row["title"], row["company"], row["location"], e)
+        finally:
+            row["apply_resume_corrections"] = False
 
     await asyncio.gather(*(get_suggestions(row) for row in rows))
 
@@ -260,17 +271,16 @@ async def generate_tailored_resume_for_row(pdf_base64: str, row: dict) -> str:
             ]
         )
         llm = get_llm()
-        response = await llm.ainvoke([message])
-        text = response.content
+        try:
+            response = await llm.ainvoke([message])
+            text = response.content
+            return _write_resume_pdf(text, row, pdf_base64)
+        except Exception as e:
+            logger.exception("Could not generate tailored resume for job=%s, company=%s, location=%s, due to: %s",
+                             row["title"], row["company"], row["location"], e)
+            return ORIGINAL_RESUME_FILE_PATH
     else:
-        text = _extract_resume_text(pdf_base64)
-
-    filename = f"{row['company']}_{row['title']}_resume.pdf".replace(" ", "_").replace("/", "-")
-    filepath = os.path.join(OUTPUT_DIRECTORY, filename)
-    style = _extract_style_profile(pdf_base64)
-    _write_resume_pdf(text, filepath, style)
-    return filepath
-
+        return ORIGINAL_RESUME_FILE_PATH
 
 @tool
 async def resume_corrections_and_download(runtime: ToolRuntime) -> str:

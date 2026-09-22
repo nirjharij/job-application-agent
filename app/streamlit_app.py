@@ -11,16 +11,10 @@ from langchain.messages import HumanMessage
 from langgraph.types import Command
 
 from agent import build_agent
+from config import OUTPUT_DIRECTORY
 from tools.apply_jobs_agent_tools import pending_tabs_open
 from utilities.jobs_csv import update_job_row
-from utilities.validation import (
-    _validate_email,
-    _validate_job_text,
-    _validate_linkedin_url,
-    _validate_name,
-    _validate_optional_text,
-    _validate_resume,
-)
+from utilities.validation import _validate_prompt, _validate_resume
 
 st.set_page_config(page_title="Job Application Agent", layout="wide")
 
@@ -66,8 +60,6 @@ if "main_response" not in st.session_state:
     st.session_state.main_response = None
 if "pending_inputs" not in st.session_state:
     st.session_state.pending_inputs = None
-if "applicant_profile" not in st.session_state:
-    st.session_state.applicant_profile = None
 
 
 def reset_session():
@@ -75,7 +67,6 @@ def reset_session():
     st.session_state.phase = "idle"
     st.session_state.main_response = None
     st.session_state.pending_inputs = None
-    st.session_state.applicant_profile = None
 
 
 def advance_phase(response) -> str:
@@ -103,8 +94,9 @@ config = {"configurable": {"thread_id": st.session_state.thread_id}}
 with st.sidebar:
     st.header("Job Application Agent")
     st.caption(
-        "Upload a resume, tell the agent what role, location, and platform to search, "
-        "and it will find jobs and suggest resume tailoring for each one."
+        "Upload a resume and describe what you're looking for in one message (role, location, "
+        "and platform if you have one), and it will find jobs and suggest resume tailoring for "
+        "each one."
     )
     if st.button("Start new session"):
         reset_session()
@@ -119,17 +111,12 @@ st.title("Job Application Agent")
 
 if st.session_state.phase == "starting":
     inputs = st.session_state.pending_inputs
-    st.info(f"Searching {inputs['platform']} for jobs and analyzing your resume against them...")
+    st.info("Searching for jobs and analyzing your resume against them...")
     with st.spinner("Working..."):
         response = run(main_agent.ainvoke(
             {
-                "messages": [HumanMessage(
-                    content=f"Find {inputs['numJobs']} job(s) for {inputs['jobRole']} in {inputs['jobLocation']} on {inputs['platform']}"
-                )],
-                "platform": inputs["platform"],
-                "numJobs": inputs["numJobs"],
+                "messages": [HumanMessage(content=inputs["userPrompt"])],
                 "pdfBase64": inputs["pdfBase64"],
-                "applicantProfile": st.session_state.applicant_profile,
             },
             config=config,
         ))
@@ -171,59 +158,25 @@ elif st.session_state.phase == "applying_wait":
 elif st.session_state.phase == "idle":
     with st.form("search_form"):
         resume_file = st.file_uploader("Resume (PDF)", type=["pdf"])
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            job_role = st.text_input("Job role", placeholder="Software Development Engineer")
-        with col2:
-            job_location = st.text_input("Location", placeholder="Berlin")
-        with col3:
-            platform = st.selectbox("Platform", options=["linkedin", "stepstone"], index=0)
-        with col4:
-            num_jobs = st.number_input("Number of jobs", min_value=1, max_value=10, value=3, step=1)
-
-        st.markdown("**Applicant details** (used later to fill out job application forms)")
-        pcol1, pcol2, pcol3 = st.columns(3)
-        with pcol1:
-            applicant_name = st.text_input("Full name")
-            applicant_phone = st.text_input("Phone", placeholder="optional")
-        with pcol2:
-            applicant_email = st.text_input("Email")
-            applicant_linkedin = st.text_input("LinkedIn URL", placeholder="optional")
-        with pcol3:
-            applicant_work_auth = st.text_input("Work authorization", placeholder="e.g. EU citizen, needs visa")
-            applicant_notice = st.text_input("Notice period", placeholder="optional")
+        user_prompt = st.text_area(
+            "What are you looking for?",
+            placeholder="I am looking for a SDE role in Noida which is part time or contract based",
+            height=100,
+        )
 
         submitted = st.form_submit_button("Find jobs & analyze resume")
 
     if submitted:
-        validation_error = (
-            _validate_resume(resume_file)
-            or _validate_job_text(job_role, "Job role")
-            or _validate_job_text(job_location, "Location")
-            or _validate_name(applicant_name)
-            or _validate_email(applicant_email)
-            or _validate_optional_text(applicant_phone, max_len=30)
-            or _validate_linkedin_url(applicant_linkedin)
-            or _validate_optional_text(applicant_work_auth)
-            or _validate_optional_text(applicant_notice)
-        )
+        validation_error = _validate_resume(resume_file) or _validate_prompt(user_prompt)
         if validation_error:
             st.error(validation_error)
         else:
-            st.session_state.applicant_profile = {
-                "name": applicant_name,
-                "email": applicant_email,
-                "phone": applicant_phone,
-                "linkedin_url": applicant_linkedin,
-                "work_authorization": applicant_work_auth,
-                "notice_period": applicant_notice,
-            }
+            resume_bytes = resume_file.getvalue()
+            with open(os.path.join(OUTPUT_DIRECTORY, "resume.pdf"), "wb") as f:
+                f.write(resume_bytes)
             st.session_state.pending_inputs = {
-                "jobRole": job_role,
-                "jobLocation": job_location,
-                "platform": platform,
-                "numJobs": int(num_jobs),
-                "pdfBase64": base64.b64encode(resume_file.read()).decode("utf-8"),
+                "userPrompt": user_prompt.strip(),
+                "pdfBase64": base64.b64encode(resume_bytes).decode("utf-8"),
             }
             st.session_state.phase = "starting"
             st.rerun()
@@ -247,51 +200,50 @@ if st.session_state.phase in ("reviewing", "done") and st.session_state.main_res
             width="stretch",
         )
 
-        tailored = [r for r in rows if r.get("resume_corrections")]
-        if tailored:
-            st.subheader("Resume tailoring suggestions")
-            if st.session_state.phase == "reviewing":
-                st.warning(
-                    "The agent is paused, waiting for you to review these suggestions. Approve/Reject "
-                    "below just mark which jobs to generate a tailored resume for — click Continue when "
-                    "you're done reviewing to let the agent proceed."
-                )
+        if st.session_state.phase == "done":
+            st.subheader("Agent summary")
+            st.write(main_response["messages"][-1].content)
+            st.button("Start a new search", on_click=reset_session)
+        else:
+            tailored = [r for r in rows if r.get("resume_corrections")]
+            if tailored:
+                st.subheader("Resume tailoring suggestions")
+                if st.session_state.phase == "reviewing":
+                    st.warning(
+                        "The agent is paused, waiting for you to review these suggestions. Approve/Reject "
+                        "below just mark which jobs to generate a tailored resume for — click Continue when "
+                        "you're done reviewing to let the agent proceed."
+                    )
 
-            for r in tailored:
-                apply_flag = str(r.get("apply_resume_corrections", "")).strip().lower() == "true"
-                status_badge = " ✅ Marked for tailoring" if apply_flag else ""
-                job_key = r["url"]
-                with st.expander(f"{r['title']} — {r['company']}{status_badge}", expanded=True):
-                    for suggestion in r["resume_corrections"].split(" | "):
-                        if suggestion.strip():
-                            st.markdown(f"- {suggestion.strip()}")
+                for r in tailored:
+                    apply_flag = str(r.get("apply_resume_corrections", "")).strip().lower() == "true"
+                    status_badge = " ✅ Marked for tailoring" if apply_flag else ""
+                    job_key = r["url"]
+                    with st.expander(f"{r['title']} — {r['company']}{status_badge}", expanded=True):
+                        for suggestion in r["resume_corrections"].split(" | "):
+                            if suggestion.strip():
+                                st.markdown(f"- {suggestion.strip()}")
 
-                    if st.session_state.phase == "reviewing":
-                        approve_col, reject_col = st.columns(2)
-                        if approve_col.button("Approve", key=f"approve_{job_key}", type="primary" if apply_flag else "secondary"):
-                            update_job_row(csv_path, job_key, apply_resume_corrections=True)
-                            st.rerun()
-                        if reject_col.button("Reject", key=f"reject_{job_key}", type="secondary" if apply_flag else "primary"):
-                            update_job_row(csv_path, job_key, apply_resume_corrections=False)
-                            st.rerun()
+                        if st.session_state.phase == "reviewing":
+                            approve_col, reject_col = st.columns(2)
+                            if approve_col.button("Approve", key=f"approve_{job_key}", type="primary" if apply_flag else "secondary"):
+                                update_job_row(csv_path, job_key, apply_resume_corrections=True)
+                                st.rerun()
+                            if reject_col.button("Reject", key=f"reject_{job_key}", type="secondary" if apply_flag else "primary"):
+                                update_job_row(csv_path, job_key, apply_resume_corrections=False)
+                                st.rerun()
 
-                    resume_path = r.get("tailored_resume_path")
-                    if resume_path and os.path.exists(resume_path):
-                        with open(resume_path, "rb") as rf:
-                            st.download_button(
-                                "Download tailored resume",
-                                data=rf.read(),
-                                file_name=os.path.basename(resume_path),
-                                key=f"download_{job_key}",
-                            )
+                        resume_path = r.get("tailored_resume_path")
+                        if resume_path and os.path.exists(resume_path):
+                            with open(resume_path, "rb") as rf:
+                                st.download_button(
+                                    "Download tailored resume",
+                                    data=rf.read(),
+                                    file_name=os.path.basename(resume_path),
+                                    key=f"download_{job_key}",
+                                )
 
-            if st.session_state.phase == "reviewing":
                 st.divider()
                 if st.button("Continue", type="primary"):
                     st.session_state.phase = "resuming"
                     st.rerun()
-
-    if st.session_state.phase == "done":
-        st.subheader("Agent summary")
-        st.write(main_response["messages"][-1].content)
-        st.button("Start a new search", on_click=reset_session)

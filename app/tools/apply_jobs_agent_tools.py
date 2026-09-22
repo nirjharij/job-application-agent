@@ -6,6 +6,7 @@ from langchain.tools import ToolRuntime, tool
 
 from config import get_llm
 from prompts.job_filler_agent_prompt import JOB_FILLER_AGENT_SYSTEM_PROMPT
+from utilities.applicant_profile import get_or_extract_applicant_profile
 from utilities.jobs_csv import (
     JOB_APPLICATION_STATUS_APPLIED,
     JOB_APPLICATION_STATUS_APPLYING,
@@ -82,7 +83,8 @@ async def start_applying(runtime: ToolRuntime) -> str:
     if not _pending_jobs:
         return ToolMessage("No jobs found in the csv — nothing to apply to.", tool_call_id=runtime.tool_call_id)
 
-    profile = runtime.context.applicantProfile or {}
+    pdf_base64 = runtime.state.get("pdfBase64")
+    profile = await get_or_extract_applicant_profile(pdf_base64) if pdf_base64 else {}
     profile_lines = "\n".join(f"- {k}: {v}" for k, v in profile.items() if v) or "(none provided)"
 
     try:
