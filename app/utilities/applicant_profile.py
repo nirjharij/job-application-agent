@@ -11,7 +11,6 @@ from utilities.jobs_db import _connect
 
 logger = logging.getLogger(__name__)
 
-
 class ApplicantProfile(BaseModel):
     name: str = Field(default="", description="Full name")
     email: str = Field(default="", description="Email address")
@@ -23,12 +22,10 @@ class ApplicantProfile(BaseModel):
     linkedin_url: str = Field(default="", description="LinkedIn profile URL, if present")
     location: str = Field(default="", description="City/location, if present")
 
-
 def _resume_hash(pdf_base64: str) -> str:
     """Deterministic id for a resume's content, so the same resume always maps to the same
     cached profile row."""
     return hashlib.sha256(pdf_base64.encode("utf-8")).hexdigest()
-
 
 def _ensure_table(conn: psycopg.Connection) -> None:
     conn.execute(
@@ -40,7 +37,6 @@ def _ensure_table(conn: psycopg.Connection) -> None:
         )
         """
     )
-
 
 def get_cached_applicant_profile(pdf_base64: str) -> dict | None:
     """Look up a previously-extracted applicant profile for this exact resume, by content hash.
@@ -59,7 +55,6 @@ def get_cached_applicant_profile(pdf_base64: str) -> dict | None:
         logger.exception("Jobs database error while reading cached applicant profile")
         return None
 
-
 def save_applicant_profile(pdf_base64: str, profile: dict) -> None:
     """Cache an extracted applicant profile, keyed by the resume's content hash."""
     try:
@@ -75,7 +70,6 @@ def save_applicant_profile(pdf_base64: str, profile: dict) -> None:
             conn.commit()
     except psycopg.Error:
         logger.exception("Jobs database error while saving applicant profile")
-
 
 async def _extract_applicant_profile(pdf_base64: str) -> dict:
     """Ask the LLM to read the resume once and pull out the applicant's contact/background
@@ -96,10 +90,13 @@ async def _extract_applicant_profile(pdf_base64: str) -> dict:
             },
         ]
     )
-    llm = get_llm().with_structured_output(ApplicantProfile)
-    result = await llm.ainvoke([message])
-    return result.model_dump()
-
+    try:
+        llm = get_llm().with_structured_output(ApplicantProfile)
+        result = await llm.ainvoke([message])
+        return result.model_dump()
+    except Exception as e:
+        logger.exception("Could not extract applicant profile from resume due to %s", e)
+        return {}
 
 async def get_or_extract_applicant_profile(pdf_base64: str) -> dict:
     """Return this resume's applicant profile — from Postgres if we've already extracted it for

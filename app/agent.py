@@ -1,4 +1,5 @@
 import logging
+import os
 
 from dotenv import load_dotenv
 from langchain.agents import AgentState, create_agent
@@ -10,8 +11,9 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.store.postgres import PostgresStore
 from langgraph.types import Command
 
-from config import get_llm
+from config import CSV_FILENAME, OUTPUT_DIRECTORY, get_llm
 from dataclasses import dataclass
+from utilities.jobs_csv import recover_and_reset_jobs_csv
 from utilities.jobs_db import DB_URI
 from prompts.apply_jobs_agent_prompt import APPLY_JOBS_AGENT_SYSTEM_PROMPT
 from prompts.job_search_agent_prompt import JOB_SEARCH_AGENT_SYSTEM_PROMPT
@@ -60,6 +62,9 @@ _store_cm = None  # holds a reference to the entered context manager below so it
 async def build_agent():
     """Build the full 3-agent system: main_agent delegates to job_search_agent and resume_handler_agent
     and apply_jobs_agent"""
+
+    recover_and_reset_jobs_csv(os.path.join(OUTPUT_DIRECTORY, CSV_FILENAME))
+
     # needed so that it is not garbage collected
     global _store_cm
     _store_cm = PostgresStore.from_conn_string(DB_URI)

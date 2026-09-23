@@ -1,4 +1,4 @@
-import os
+import logging
 import re
 
 from langchain.messages import HumanMessage, SystemMessage, ToolMessage
@@ -23,6 +23,7 @@ _pending_jobs: list[dict] = []
 # Bounds each job's tool-calling loop below so a confused model can't run forever on one job.
 _MAX_STEPS_PER_JOB = 40
 
+logger = logging.getLogger(__name__)
 
 def _mark_applied(csv_path: str | None, url: str) -> None:
     """Mark a job applied in Postgres (the real dedup source of truth) and, if we know the csv
@@ -31,7 +32,6 @@ def _mark_applied(csv_path: str | None, url: str) -> None:
     mark_job_applied(url)
     if csv_path:
         update_job_row(csv_path, url, job_application_status=JOB_APPLICATION_STATUS_APPLIED)
-
 
 async def _fill_one_job(llm_with_tools, tools_by_name: dict, job: dict, profile_lines: str) -> str:
     """Drive a single job application to completion via a plain bind_tools() + loop"""
@@ -54,9 +54,14 @@ async def _fill_one_job(llm_with_tools, tools_by_name: dict, job: dict, profile_
             if tool_fn is None:
                 messages.append(ToolMessage(content=f"Unknown tool '{call['name']}'.", tool_call_id=call["id"]))
                 continue
-            messages.append(await tool_fn.ainvoke(call))
+            try:
+                result = await tool_fn.ainvoke(call)
+            except Exception as e:
+                logger.exception("Tool '%s' failed while filling job %s", call["name"], job.get("url"))
+                messages.append(ToolMessage(content=f"Tool '{call['name']}' failed: {e}", tool_call_id=call["id"]))
+                continue
+            messages.append(result)
     return "Gave up after too many steps without finishing."
-
 
 @tool
 async def start_applying(runtime: ToolRuntime) -> str:
@@ -67,14 +72,6 @@ async def start_applying(runtime: ToolRuntime) -> str:
     csv_path = runtime.state.get("pathToJobsCsv")
     if not csv_path:
         return ToolMessage("No jobs csv path found in state.", tool_call_id=runtime.tool_call_id)
-
-    # Sanity check: a previous run may have crashed (or the app was restarted) while a job's
-    # browser fill was in progress — that job's status is still "applying" in the csv even though
-    # Postgres never heard about it. Finalize any such leftovers before starting fresh.
-    if os.path.exists(csv_path):
-        for row in read_job_rows(csv_path):
-            if row.get("job_application_status") == JOB_APPLICATION_STATUS_APPLYING:
-                _mark_applied(csv_path, row["url"])
 
     rows = read_job_rows(csv_path)
 
@@ -112,7 +109,6 @@ async def start_applying(runtime: ToolRuntime) -> str:
         tool_call_id=runtime.tool_call_id,
     )
 
-
 async def pending_tabs_open() -> bool:
     """True if any tab this run opened is still open. Polled by the Streamlit UI to decide when to \
     resume apply_jobs_agent's post_job_apply interrupt — the actual wait for the human to review, \
@@ -120,11 +116,14 @@ async def pending_tabs_open() -> bool:
     session = get_current_apply_jobs_session()
     if session is None:
         return False
-    result = await session.call_tool("browser_tabs", {"action": "list"})
-    text = result.content[0].text if result.content else ""
+    try:
+        result = await session.call_tool("browser_tabs", {"action": "list"})
+        text = result.content[0].text if result.content else ""
+    except Exception:
+        logger.exception("Failed to check open tabs via MCP — assuming tabs are still open")
+        return True
     urls = re.findall(r"\]\((\S+)\)", text)
     return any(url != "about:blank" for url in urls)
-
 
 @tool
 async def post_job_apply(runtime: ToolRuntime) -> str:
