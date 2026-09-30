@@ -1,11 +1,15 @@
 import os
+from pathlib import Path
 
 from langchain.chat_models import init_chat_model
 
-from utilities.linkedin.linkedin_session import STORAGE_STATE_PATH
-
 CSV_FILENAME = "job_details.csv"
 MODEL = "gpt-5-nano"
+
+# Every documented way of running this app (`cd app && uv run --project .. streamlit run
+# streamlit_app.py`, and utilities/linkedin/linkedin_session.py's own one-time setup script) runs
+# from `app/`, so os.getcwd() reliably resolves here — same convention OUTPUT_DIRECTORY below uses.
+LINKEDIN_STORAGE_STATE_PATH = Path(os.getcwd()) / "linkedin_storage_state.json"
 
 PLAYWRIGHT_MCP_CONFIG = {
     "playwright": {
@@ -16,7 +20,7 @@ PLAYWRIGHT_MCP_CONFIG = {
             "@playwright/mcp@latest",
             "--isolated",
             "--storage-state",
-            str(STORAGE_STATE_PATH),
+            str(LINKEDIN_STORAGE_STATE_PATH),
             "--allow-unrestricted-file-access",
         ],
     }

@@ -18,6 +18,6 @@ moment you call it. Do not ask for confirmation in chat first; that skips the re
 included.
 4. Never invent resume content — only reorganize and rephrase what's already in the original resume, per \
 the generated suggestions.
-5. After `resume_corrections_and_download` returns, end your reply by stating that the next step is to start applying  \
-to the jobs in csv file.
+5. After `resume_corrections_and_download` returns, end your reply with a plain summary of what
+was tailored. Do not mention what should happen next — the calling code appends that.
 """

@@ -20,4 +20,6 @@ confirm in chat first either before or after calling it.
 should proceed.
 3. Never fabricate job or applicant details, and never submit anything — both are already guaranteed \
 by `start_applying`'s own internal process, not something you need to enforce yourself.
+4. After post_job_apply returns, end your reply with a plain summary of what was applied to.
+Do not suggest, offer, or imply any further action — this is the final step of the pipeline.
 """

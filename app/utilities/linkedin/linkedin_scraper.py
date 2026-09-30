@@ -44,20 +44,30 @@ class LinkedInJobScraper:
             raise LinkedInSearchEmptyError(
                 f"LinkedIn search for role={role!r} location={location!r} failed: {exc}"
             ) from exc
+        logger.info("Jobs Found for role=%s & location=%s are: %s", role, location, str(search_result))
 
         job_ids = search_result.get("job_ids", [])
+
+        logger.info("Job Ids for role=%s & location=%s are: %s", role, location, str(job_ids))
+
         if job_ids == []:
             reason = "search_jobs returned no job_ids"
             logger.error("LinkedIn search failed: role=%r location=%r reason=%s", role, location, reason)
             raise LinkedInSearchEmptyError(
                 f"LinkedIn search for role={role!r} location={location!r} returned no jobs ({reason})."
             )
+
         job_ids = job_ids[:limit]
-        titles_by_id = {
-            ref["url"].strip("/").split("/")[-1]: ref["text"]
-            for ref in search_result.get("references", {}).get("search_results", [])
-            if ref.get("kind") == "job"
-        }
+
+        try:
+            titles_by_id = {
+                ref["url"].strip("/").split("/")[-1]: ref["text"]
+                for ref in search_result.get("references", {}).get("search_results", [])
+                if ref.get("kind") == "job"
+            }
+        except KeyError as e:
+            logger.exception("During parsing Job search results, could not find key: %s", e)
+            titles_by_id = {}
 
         with open(output_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)

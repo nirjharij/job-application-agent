@@ -136,7 +136,9 @@ async def build_agent():
             })
         return Command(update={
             "pathToJobsCsv": response.get("pathToJobsCsv"),
-            "messages": [ToolMessage(response["messages"][-1].content, tool_call_id=runtime.tool_call_id)],
+            "messages": [ToolMessage(response["messages"][-1].content
+            +"\n\nNext step is to analyze resume",
+            tool_call_id=runtime.tool_call_id)],
         })
 
     @tool
@@ -165,7 +167,9 @@ prepare tailored versions."""
             })
         return Command(update={
             "pathToJobsCsv": response.get("pathToJobsCsv"),
-            "messages": [ToolMessage(response["messages"][-1].content, tool_call_id=runtime.tool_call_id)],
+            "messages": [ToolMessage(response["messages"][-1].content
+             + "\n\nNext step: Resume tailoring is complete, the next step is to apply to these jobs.",
+             tool_call_id=runtime.tool_call_id)],
         })
 
     @tool

@@ -1,9 +1,9 @@
 import asyncio
 import base64
 import csv
+import logging
 import os
 import time
-import traceback
 import uuid
 
 import streamlit as st
@@ -12,9 +12,13 @@ from langgraph.types import Command
 
 from agent import build_agent
 from config import OUTPUT_DIRECTORY
+from logging_config import configure_logging
 from tools.apply_jobs_agent_tools import pending_tabs_open
 from utilities.jobs_csv import update_job_row
 from utilities.validation import _validate_prompt, _validate_resume
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Job Application Agent", layout="wide")
 
@@ -34,9 +38,7 @@ def run(coro):
     try:
         return get_event_loop().run_until_complete(coro)
     except BaseException:
-        with open("error.log", "a", encoding="utf-8") as f:
-            f.write(f"\n{'=' * 80}\n{time.strftime('%Y-%m-%d %H:%M:%S')} phase={st.session_state.get('phase')}\n")
-            traceback.print_exc(file=f)
+        logger.exception("Agent call failed (phase=%s)", st.session_state.get("phase"))
         raise
 
 

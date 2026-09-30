@@ -30,6 +30,6 @@ async def job_finder(runtime: ToolRuntime, role: str, city: str, num_jobs: int =
     return Command(update={
         "pathToJobsCsv": csv_path,
         "messages": [ToolMessage(
-            f"Successfully updated csv file at path: {csv_path}. Next step is to analyze resume",
+            f"Successfully updated csv file at path: {csv_path}.",
             tool_call_id=runtime.tool_call_id,
         )]})

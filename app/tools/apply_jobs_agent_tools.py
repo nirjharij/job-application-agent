@@ -47,6 +47,9 @@ async def _fill_one_job(llm_with_tools, tools_by_name: dict, job: dict, profile_
     for _ in range(_MAX_STEPS_PER_JOB):
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
+
+        logger.info("Tool calls for Applying to job %s", str(response.tool_calls))
+
         if not response.tool_calls:
             return str(response.content)
         for call in response.tool_calls:
