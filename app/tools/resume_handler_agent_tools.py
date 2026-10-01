@@ -12,6 +12,7 @@ from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command
 
 from config import OUTPUT_DIRECTORY, get_llm
+from utilities.applicant_profile import get_or_extract_applicant_profile
 
 logger = logging.getLogger(__name__)
 # fpdf2's core fonts only support latin-1 — LLM output commonly includes smart quotes, en/em
@@ -135,9 +136,12 @@ def _classify_resume_line(stripped: str, is_first_nonempty: bool) -> str:
         return "header"
     return "body"
 
-def _write_resume_pdf(text: str, row: dict, pdf_base64: str) -> str:
-    filename = f"{row['company']}_{row['title']}_resume.pdf".replace(" ", "_").replace("/", "-")
-    filepath = os.path.join(OUTPUT_DIRECTORY, filename)
+def _write_resume_pdf(text: str, row: dict, pdf_base64: str, profile: dict) -> str:
+
+    filename = f"{profile['name']}_resume.pdf".replace(" ", "_").replace("/", "-")
+    company_dir = os.path.join(OUTPUT_DIRECTORY, row['company'].replace(" ", "_").replace("/", "-"))
+    os.makedirs(company_dir, exist_ok=True)
+    filepath = os.path.join(company_dir, filename)
     style = _extract_style_profile(pdf_base64)
 
     for char, replacement in _PDF_CHAR_REPLACEMENTS.items():
@@ -239,7 +243,7 @@ async def analyze_resume_and_make_suggestions(runtime: ToolRuntime) -> str:
     )
 
 
-async def generate_tailored_resume_for_row(pdf_base64: str, row: dict) -> str:
+async def generate_tailored_resume_for_row(pdf_base64: str, row: dict, profile: dict) -> str:
     """Generate one resume file for a single job row (never overwrites the original resume).
 
     If the job's suggestions were approved (apply_resume_corrections == "true"), the resume is
@@ -274,7 +278,7 @@ async def generate_tailored_resume_for_row(pdf_base64: str, row: dict) -> str:
         try:
             response = await llm.ainvoke([message])
             text = response.content
-            return _write_resume_pdf(text, row, pdf_base64)
+            return _write_resume_pdf(text, row, pdf_base64, profile)
         except Exception as e:
             logger.exception("Could not generate tailored resume for job=%s, company=%s, location=%s, due to: %s",
                              row["title"], row["company"], row["location"], e)
@@ -299,13 +303,14 @@ async def resume_corrections_and_download(runtime: ToolRuntime) -> str:
 
     saved_files = []
 
-    async def apply_suggestions(row):
+    async def apply_suggestions(row, profile):
         row.setdefault("tailored_resume_path", "")
-        filepath = await generate_tailored_resume_for_row(pdf_base64, row)
+        filepath = await generate_tailored_resume_for_row(pdf_base64, row, profile)
         row["tailored_resume_path"] = filepath
         saved_files.append(filepath)
 
-    await asyncio.gather(*(apply_suggestions(row) for row in rows))
+    profile = await get_or_extract_applicant_profile(pdf_base64) if pdf_base64 else {}
+    await asyncio.gather(*(apply_suggestions(row, profile) for row in rows))
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -316,8 +321,7 @@ async def resume_corrections_and_download(runtime: ToolRuntime) -> str:
         "pathToJobsCsv": csv_path,
         "tailoredResumeFiles": saved_files,
         "messages": [ToolMessage(
-            f"Saved {len(saved_files)} tailored resume file(s): {', '.join(saved_files)}. "
-            f"Next steps: Start applying to the jobs present in jobs csv file",
+            f"Saved {len(saved_files)} tailored resume file(s) in output folder",
             tool_call_id=runtime.tool_call_id,
         )],
     })

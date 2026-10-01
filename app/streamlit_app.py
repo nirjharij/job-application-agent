@@ -14,7 +14,12 @@ from agent import build_agent
 from config import OUTPUT_DIRECTORY
 from logging_config import configure_logging
 from tools.apply_jobs_agent_tools import pending_tabs_open
-from utilities.jobs_csv import update_job_row
+from utilities.jobs_csv import (
+    JOB_APPLICATION_STATUS_APPLIED,
+    JOB_APPLICATION_STATUS_APPLYING,
+    update_job_row,
+)
+from utilities.jobs_db import mark_job_applied
 from utilities.validation import _validate_prompt, _validate_resume
 
 configure_logging()
@@ -56,7 +61,8 @@ if "phase" not in st.session_state:
     # idle -> starting -> reviewing -> applying_wait -> resuming -> done
     # (resuming is shared: it's used both after "Continue" in reviewing, and after every
     # application tab is closed in applying_wait, since both are just resuming main_agent's
-    # own interrupted thread)
+    # own interrupted thread — applying_wait's resume lets the now-trivial
+    # request_application_review tool finish, it does no marking itself)
     st.session_state.phase = "idle"
 if "main_response" not in st.session_state:
     st.session_state.main_response = None
@@ -86,7 +92,7 @@ def advance_phase(response) -> str:
         action_name = interrupts[0].value["action_requests"][0]["name"]
         if action_name == "resume_corrections_and_download":
             return "reviewing"
-        if action_name == "post_job_apply":
+        if action_name == "request_application_review":
             return "applying_wait"
     return "done"
 
@@ -194,13 +200,26 @@ if st.session_state.phase in ("reviewing", "done") and st.session_state.main_res
     if not rows:
         st.info("No jobs were found for that role and location.")
     else:
-        st.dataframe(
-            [
-                {"Title": r["title"], "Company": r["company"], "Location": r["location"], "URL": r["url"]}
-                for r in rows
-            ],
-            width="stretch",
-        )
+        header_cols = st.columns([3, 2, 2, 3, 2])
+        for col, label in zip(header_cols, ["Title", "Company", "Location", "URL", "Applied"]):
+            col.markdown(f"**{label}**")
+        for r in rows:
+            job_key = r["url"]
+            status = r.get("job_application_status", "")
+            row_cols = st.columns([3, 2, 2, 3, 2])
+            row_cols[0].write(r["title"])
+            row_cols[1].write(r["company"])
+            row_cols[2].write(r["location"])
+            row_cols[3].write(r["url"])
+            if status == JOB_APPLICATION_STATUS_APPLIED:
+                row_cols[4].markdown("✅ Applied")
+            elif status == JOB_APPLICATION_STATUS_APPLYING:
+                if row_cols[4].button("Mark as Applied", key=f"mark_applied_{job_key}"):
+                    mark_job_applied(job_key)
+                    update_job_row(csv_path, job_key, job_application_status=JOB_APPLICATION_STATUS_APPLIED)
+                    st.rerun()
+            else:
+                row_cols[4].write("—")
 
         if st.session_state.phase == "done":
             st.subheader("Agent summary")

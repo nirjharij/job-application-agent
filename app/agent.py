@@ -20,7 +20,7 @@ from prompts.job_search_agent_prompt import JOB_SEARCH_AGENT_SYSTEM_PROMPT
 from prompts.main_agent_prompt import MAIN_AGENT_SYSTEM_PROMPT
 from prompts.resume_handler_agent_prompt import RESUME_HANDLER_AGENT_SYSTEM_PROMPT
 from tools.apply_jobs_agent_tools import (
-    post_job_apply,
+    request_application_review,
     start_applying,
 )
 from tools.job_search_agent_tools import job_finder
@@ -89,13 +89,13 @@ async def build_agent():
         system_prompt=APPLY_JOBS_AGENT_SYSTEM_PROMPT,
         tools=[
             start_applying,
-            post_job_apply,
+            request_application_review,
         ],
         state_schema=ApplyJobsAgentState,
         checkpointer=True,
         middleware=[
             HumanInTheLoopMiddleware(
-                interrupt_on={"post_job_apply": True}
+                interrupt_on={"request_application_review": True}
             ),
         ],
     )
@@ -175,9 +175,9 @@ prepare tailored versions."""
     @tool
     async def call_apply_jobs_agent(runtime: ToolRuntime) -> str:
         """Call the apply-jobs subagent to fill out applications for the jobs once resume tailoring is complete."""
-        # Same as call_resume_handler_agent above: apply_jobs_agent's own post_job_apply interrupt
-        # propagates straight out of this await and pauses main_agent's own run instead — nothing
-        # below this line runs until apply_jobs_agent has genuinely finished.
+        # Same as call_resume_handler_agent above: apply_jobs_agent's own request_application_review
+        # interrupt propagates straight out of this await and pauses main_agent's own run instead —
+        # nothing below this line runs until apply_jobs_agent has genuinely finished.
         try:
             response = await apply_jobs_agent.ainvoke(
                 {
