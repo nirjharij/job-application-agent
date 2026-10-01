@@ -7,11 +7,11 @@ from tools.apply_jobs_agent_tools import (
     _MAX_STEPS_PER_JOB,
     _fill_one_job,
     pending_tabs_open,
-    post_job_apply,
+    request_application_review,
     start_applying,
 )
 
-from conftest import CSV_FIELDNAMES, FakeProfileContext, FakeResponse, FakeRuntime, job_row, write_csv
+from conftest import CSV_FIELDNAMES, FakeProfileContext, FakeResponse, FakeRuntime, write_csv
 
 JOB = {"url": "https://x/jobs/view/1/", "description": "Python role", "tailored_resume_path": "/r.pdf"}
 
@@ -139,7 +139,6 @@ async def test_start_applying_processes_every_row_sequentially(jobs_csv, apply_e
         "https://www.linkedin.com/jobs/view/222/",
     ]
     assert "Processed 2 job(s):" in result.content
-    assert aj._pending_jobs and len(aj._pending_jobs) == 2
 
 
 async def test_start_applying_formats_the_applicant_profile(jobs_csv, apply_env):
@@ -229,40 +228,20 @@ async def test_a_titled_markdown_link_matches_nothing(monkeypatch):
     assert await pending_tabs_open() is False
 
 
-# --- post_job_apply -------------------------------------------------------------------------
+# --- request_application_review --------------------------------------------------------------
 
 
-@pytest.fixture
-def marked(monkeypatch):
-    urls = []
-    monkeypatch.setattr(aj, "mark_job_applied", urls.append)
-    return urls
+async def test_request_application_review_returns_a_confirmation():
+    result = await request_application_review.coroutine(runtime=FakeRuntime(tool_call_id="c9"))
 
-
-async def test_post_job_apply_with_nothing_pending(marked):
-    aj._pending_jobs = []
-    result = await post_job_apply.coroutine(runtime=FakeRuntime())
-
-    assert result.content == "No pending applications to mark as applied."
-    assert marked == []
-
-
-async def test_post_job_apply_marks_every_pending_job_in_order(marked):
-    aj._pending_jobs = [job_row(url="https://x/1"), job_row(url="https://x/2")]
-    result = await post_job_apply.coroutine(runtime=FakeRuntime(tool_call_id="c9"))
-
-    assert marked == ["https://x/1", "https://x/2"]
-    assert result.content == "2 application(s) marked as applied."
+    assert result.content == "Every application tab has been reviewed and closed."
     assert result.tool_call_id == "c9"
 
 
-async def test_post_job_apply_drains_the_pending_list(marked):
-    aj._pending_jobs = [job_row(url="https://x/1")]
+async def test_request_application_review_does_not_mark_anything_applied(monkeypatch):
+    # Marking a job applied is now an independent Streamlit button, not this tool's job.
+    calls = []
+    monkeypatch.setattr(aj, "mark_job_applied", calls.append, raising=False)
+    await request_application_review.coroutine(runtime=FakeRuntime())
 
-    await post_job_apply.coroutine(runtime=FakeRuntime())
-    assert aj._pending_jobs == []
-
-    # A second call is a no-op rather than a duplicate round of DB writes.
-    second = await post_job_apply.coroutine(runtime=FakeRuntime())
-    assert second.content == "No pending applications to mark as applied."
-    assert marked == ["https://x/1"]
+    assert calls == []

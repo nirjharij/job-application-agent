@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from utilities import linkedin_scraper
-from utilities.linkedin_scraper import CSV_FIELDNAMES, LinkedInJobScraper
+from utilities.linkedin import linkedin_scraper
+from utilities.linkedin.linkedin_scraper import CSV_FIELDNAMES, LinkedInJobScraper
 
 from conftest import read_csv
 

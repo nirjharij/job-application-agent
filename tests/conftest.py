@@ -5,7 +5,7 @@ Two conventions used throughout the suite:
 * Tools decorated with `@tool` are exercised through `.coroutine` (the undecorated function)
   rather than `.ainvoke({...})`, because LangChain injects the real `ToolRuntime` and we want
   to hand in our own.
-* Collaborators are patched at the *import site* (`job_scraper.is_job_applied`), never at the
+* Collaborators are patched at the *import site* (`linkedin_scraper.is_job_applied`), never at the
   definition site (`jobs_db.is_job_applied`), since every module does `from x import y`.
 """
 
@@ -126,23 +126,13 @@ def jobs_csv(tmp_path):
 @pytest.fixture(autouse=True)
 def reset_module_state():
     """These modules keep process-lifetime globals that would otherwise leak between tests."""
-    from tools import apply_jobs_agent_tools
     from utilities import mcp_tools
 
     yield
-    apply_jobs_agent_tools._pending_jobs = []
     mcp_tools._mcp_session = None
     mcp_tools._mcp_session_cm = None
     mcp_tools._linkedin_client = None
     mcp_tools._linkedin_tools = None
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    """The StepStone scraper sleeps 1s per page and per job."""
-    from utilities import job_scraper
-
-    monkeypatch.setattr(job_scraper.time, "sleep", lambda _: None)
 
 
 # --- streamlit_app import shim -------------------------------------------------------------

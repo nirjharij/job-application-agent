@@ -17,8 +17,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     `resume_handler_agent_tools.py`, `apply_jobs_agent_tools.py`); `call_job_search_agent` stays
     defined inline in `agent.py` since it closes over the `job_search_agent` graph built in the
     same function.
-  - `utilities/` — the scrapers (`job_scraper.py` for StepStone, `linkedin_scraper.py` for LinkedIn)
-    and `jobs_db.py` (the Postgres `jobs_applied` dedup table helpers).
+  - `utilities/` — the LinkedIn scraper (`linkedin/linkedin_scraper.py`, via the LinkedIn MCP
+    server) and `jobs_db.py` (the Postgres `jobs_applied` dedup table helpers).
   - `ui/browser.py` — a Playwright helper that opens a job's URL in a real browser window; no longer
     called from anywhere (superseded by `apply_jobs_agent`'s bulk-apply flow), left in place as dead
     code rather than deleted along with the feature that used it.
@@ -60,20 +60,35 @@ uv sync
 uv run jupyter lab
 ```
 
-To search jobs on LinkedIn (rather than just StepStone), a one-time interactive login is required so
-the LinkedIn MCP server has a session to reuse:
+To search jobs on LinkedIn, a one-time interactive login is required so the LinkedIn MCP server has
+a session to reuse:
 ```bash
 uvx mcp-server-linkedin@latest --login
 ```
 
+The first time a search actually runs, expect a real Chromium window to flash on screen for well
+under a second, then vanish — this is `mcp-server-linkedin` itself (an external `uvx`-installed
+package, unrelated to `apply_jobs_agent`'s own Playwright browser below), not a bug. It deliberately
+avoids running fully headless, since headless Chromium announces itself to LinkedIn via its user
+agent and gets flagged as a bot; instead it launches headed, then hands off to a windowless CDP
+target and closes the visible startup window — a handoff Chromium can't complete before its startup
+window is drawn, so the brief flash is unavoidable. It only happens once per app run (the connection
+is cached and reused for every later search), and there's nothing to configure here since the
+package isn't vendored in this repo.
+
 To let `apply_jobs_agent`'s Playwright browser open LinkedIn job pages already signed in (rather
 than hitting LinkedIn's sign-in wall on every run), a one-time setup seeds a storage_state file from
-a manually-copied `li_at` cookie — see `app/utilities/linkedin_session.py` for why (in short: signing
-into LinkedIn via "Sign in with Google" inside the automated browser gets blocked by Google itself,
-not LinkedIn, so the login has to happen in a normal browser instead):
+manually-copied `li_at` and `JSESSIONID` cookies — see `app/utilities/linkedin/linkedin_session.py`
+for why (in short: signing into LinkedIn via "Sign in with Google" inside the automated browser gets
+blocked by Google itself, not LinkedIn, so the login has to happen in a normal browser instead).
+Both cookies are required — `li_at` alone produces an `ERR_TOO_MANY_REDIRECTS` loop on
+linkedin.com, since LinkedIn also uses `JSESSIONID` as a CSRF token paired with `li_at`:
 1. Log into LinkedIn normally in your everyday Chrome.
-2. DevTools → Application → Cookies → `https://www.linkedin.com` → copy the `li_at` value.
-3. From `app/`: `uv run --project .. python -m utilities.linkedin_session`, paste the value when prompted.
+2. DevTools → Application → Cookies → `https://www.linkedin.com` → copy the `li_at` value, and
+   separately the `JSESSIONID` value (including its surrounding `"` quotes, exactly as DevTools
+   shows it — LinkedIn's own frontend JS reads the cookie verbatim to set a CSRF header).
+3. From `app/`: `uv run --project .. python -m utilities.linkedin.linkedin_session`, paste both
+   values when prompted.
 
 This writes `app/linkedin_storage_state.json` (gitignored, same sensitivity tier as `.env`). Redo it
 whenever the cookie stops working (password change, LinkedIn's "unusual activity" check, or its
@@ -116,25 +131,29 @@ after being resumed) — no relay message needed. See "Streamlit app" below for 
   to outlive `build_agent()` for the life of the Streamlit process, same as `main_agent`'s
   `InMemorySaver`.
 - **`job_search_agent`** (`JobSearchAgentState`) — `main_agent`'s subagent for the search step only.
-  Tools: `job_finder` (scrapes StepStone directly or LinkedIn via MCP, writes `job_details.csv`,
-  returns a `Command` updating `pathToJobsCsv`).
+  Tools: `job_finder` (scrapes LinkedIn via MCP, writes `job_details.csv`, returns a `Command`
+  updating `pathToJobsCsv`).
 - **`resume_handler_agent`** (`ResumeHandlerAgentState`) — entered only via `main_agent`'s
   `call_resume_handler_agent`. Tools: `analyze_resume_and_make_suggestions` (compares the resume PDF
   to each job description, writes suggestions + `apply=False` back into the jobs csv),
   `resume_corrections_and_download` (generates one tailored resume `.txt` per row with `apply=True`,
   never overwriting the original resume) — its `HumanInTheLoopMiddleware` interrupt is configured on
   this tool, and per the nested-propagation design above, pausing here pauses `main_agent`'s own run.
-- **`apply_jobs_agent`** (`ApplyJobsAgentState`, `JobApplyContext`) — entered only via `main_agent`'s
-  `call_apply_jobs_agent`; its `HumanInTheLoopMiddleware` interrupt is configured on `post_job_apply`,
-  not `start_applying` — every job gets opened and filled in automatically with no approval gate
-  first (filling a form never submits anything, so there's nothing to approve), and the pause instead
-  happens right before jobs get marked applied. See "Applying to jobs" below for its tools.
+- **`apply_jobs_agent`** (`ApplyJobsAgentState`) — entered only via `main_agent`'s
+  `call_apply_jobs_agent`; its `HumanInTheLoopMiddleware` interrupt is configured on
+  `request_application_review`, not `start_applying` — every job gets opened and filled in
+  automatically with no approval gate first (filling a form never submits anything, so there's
+  nothing to approve), and the pause instead happens right after every job has been filled in, so the
+  human can review, submit, and close each tab. `request_application_review` itself does nothing but
+  serve as that pause point — it does not mark anything applied. Marking a job applied is a separate,
+  independent action: a "Mark as Applied" button per job row in the Streamlit UI (see "Streamlit app"
+  below), decoupled entirely from the agent run. See "Applying to jobs" below for its tools.
 
 Key state-passing conventions:
-- `platform` ("linkedin" or "stepstone") and `numJobs` are set by the Streamlit UI into `main_agent`
-  state and read from state inside `call_job_search_agent` — never re-extracted from the LLM's own
-  prose, because that previously caused the subagent to silently get the wrong tools (and the same
-  exact-value risk applies to an exact job count).
+- Search is LinkedIn-only — there is no `platform` concept anywhere in the pipeline. `role`,
+  `city`, and `numJobs` are parsed by `main_agent`'s own LLM from the user's free-text message and
+  passed as `call_job_search_agent` tool-call arguments (`numJobs` defaults to 3 when unspecified);
+  `job_finder` additionally clamps `numJobs` to `[1, 10]` itself regardless of what it's given.
 - `pathToJobsCsv` is the single source of truth for where the jobs csv lives; it flows from
   `job_finder` → `main_agent` state → the Streamlit session → `resume_handler_agent` state, and
   `call_apply_jobs_agent` reads it back out of `main_agent`'s own state (`runtime.state.get
@@ -167,10 +186,10 @@ A single Postgres instance (`JOBS_DB_URI`) serves two unrelated purposes:
 - **`jobs_applied` dedup table** — a plain table (`id UUID PRIMARY KEY, url TEXT UNIQUE, applied_at`)
   managed by hand-written SQL in `jobs_db.py`, unrelated to the store's own internal tables. `id` is
   `uuid.uuid5(uuid.NAMESPACE_URL, url)` — deterministic, so the same job url always maps to the same
-  row without needing a prior lookup to get an id. `mark_job_applied(url)` is called from
-  `post_job_apply` (`tools/apply_jobs_agent_tools.py`), once per job that was filled in, after the
-  Streamlit app has confirmed every opened tab is closed and resumed `main_agent`'s interrupt
-  (replacing the old `decision="applied"` csv column); `is_job_applied(url)` gates both scrapers
+  row without needing a prior lookup to get an id. `mark_job_applied(url)` is called directly from
+  `streamlit_app.py`'s per-job "Mark as Applied" button handler (see "Streamlit app" below) — not from
+  any `apply_jobs_agent` tool — once the human clicks it for that specific job (replacing the old
+  `decision="applied"` csv column); `is_job_applied(url)` gates both scrapers
   (`job_scraper.py`, `linkedin_scraper.py`) so already-applied jobs are skipped before being written to
   a new search's csv.
 
@@ -192,44 +211,41 @@ config=main_config)` — used both after "Continue" in `reviewing` and after eve
 - else, if `response.get("__interrupt__")` is set, inspects
   `response["__interrupt__"][0].value["action_requests"][0]["name"]` (the `HITLRequest` shape
   `HumanInTheLoopMiddleware` raises) to tell the two possible pauses apart —
-  `"resume_corrections_and_download"` → `reviewing`, `"post_job_apply"` → `applying_wait`,
+  `"resume_corrections_and_download"` → `reviewing`, `"request_application_review"` → `applying_wait`,
 - else → `done`.
 
 `applying_wait` is a pure poll loop, independent of any agent call: while `pending_tabs_open()`
 (`tools/apply_jobs_agent_tools.py`) reports any job tab still open, it shows a waiting message,
 sleeps briefly, and reruns; once every tab is closed, it just sets phase to `resuming` — the actual
-resume (which lets `post_job_apply` run and mark the jobs applied) happens there, uniformly with
-every other resume.
+resume (which lets the now-trivial `request_application_review` tool finish, so `main_agent`'s run
+can complete) happens there, uniformly with every other resume. Once the run completes, `done` shows
+a "Mark as Applied" button per job row that was actually filled in — see "Jobs found" table below.
 
 Phases that call a long-running agent (`starting`, `resuming`) are handled at the very top of the
 script, before any interactive widget renders — this ensures the "busy" UI state (no clickable
 buttons) is shown on the very next rerun, closing the window for a duplicate click to fire a second
 overlapping call on the same LangGraph thread. `applying_wait` follows the same convention.
 
-### Scrapers
+### Scraper
 
-- **`app/utilities/job_scraper.py`** — StepStone: plain `requests` + BeautifulSoup, parses the
-  `JobPosting` JSON-LD block embedded in each job detail page. Synchronous, rate-limited with
-  `time.sleep(1)` between requests.
-- **`app/utilities/linkedin_scraper.py`** — LinkedIn: goes through the `mcp-server-linkedin` MCP server
-  (`langchain_mcp_adapters.MultiServerMCPClient`, stdio transport) rather than scraping HTML
-  directly, since LinkedIn exposes no structured job schema. `_parse_job_posting_text` is a
+- **`app/utilities/linkedin/linkedin_scraper.py`** — LinkedIn: goes through the `mcp-server-linkedin`
+  MCP server (`langchain_mcp_adapters.MultiServerMCPClient`, stdio transport) rather than scraping
+  HTML directly, since LinkedIn exposes no structured job schema. `_parse_job_posting_text` is a
   best-effort heuristic split of unstructured MCP text output into company/location/description
   (company = first line, location = first line containing `" · "`, description = text after "About
   the job"). `linkedin_tool_messages_to_csv` is an alternate path for consolidating results when the
   LLM calls the LinkedIn MCP tools directly via dynamic tool selection, instead of going through
   `scrape_linkedin_jobs_to_csv`.
 
-Both scrapers normalize to the same csv schema (`title, company, location, employment_type,
-date_posted, salary_min, salary_max, salary_currency, description, url`) so `agent.py`'s tools work
-identically regardless of platform.
+The output csv schema is `title, company, location, employment_type, date_posted, salary_min,
+salary_max, salary_currency, description, url`.
 
 ### Applying to jobs (`app/tools/apply_jobs_agent_tools.py`)
 
 `apply_jobs_agent`'s tools are the stock `langchain_community` `PlayWrightBrowserToolkit` tools
 (`navigate_browser`, `click_element`, `extract_text`, `extract_hyperlinks`, `get_elements`,
 `previous_webpage`, `current_webpage`) plus custom ones defined here (`start_applying`,
-`open_new_tab`, `fill_element`, `upload_file`, `post_job_apply`) — unlike the earlier
+`open_new_tab`, `fill_element`, `upload_file`, `request_application_review`) — unlike the earlier
 `browser-use`-based design, there's no separate LLM loop hidden inside a library call; the agent's
 own `create_agent` tool-calling loop *is* what decides each click/fill/navigate, one small step at a
 time, driven by `prompts/apply_jobs_agent_prompt.py`.
@@ -266,18 +282,18 @@ time, driven by `prompts/apply_jobs_agent_prompt.py`.
   url/description, plus the applicant's own details from `runtime.context.applicantProfile`
   (`JobApplyContext`), as its tool output — it is *not* gated, so the whole fill-in loop for every job
   runs automatically once it's called.
-- `post_job_apply` is the tool `HumanInTheLoopMiddleware` gates (`interrupt_on={"post_job_apply": True}`
-  in `agent.py`) — the pause happens right before it runs, after every job has already been opened and
-  filled in, not before any browser action (see `apply_jobs_agent` in "Agent graph" above for why
-  filling isn't gated). Unlike the tool it replaced (`verify_and_submit`), it does **not** block or
-  poll itself — it just marks every pending job applied via `mark_job_applied` and returns immediately.
-  The actual "wait for the human to review, submit, and close every tab" logic now lives in
-  Streamlit's `applying_wait` phase (see "Streamlit app" above), which polls `pending_tabs_open()` and
-  only moves on to resuming `main_agent` once every tab is confirmed closed — moving that wait out of
-  the tool is what makes the interrupt actually resumable instead of hanging forever. Jobs
-  pending application are tracked in a module-level list (`_pending_jobs`/`_opened_pages`) between
-  `start_applying`/`open_new_tab` and `post_job_apply`/`pending_tabs_open`, for the same reason the
-  browser itself is module-level.
+- `request_application_review` is the tool `HumanInTheLoopMiddleware` gates
+  (`interrupt_on={"request_application_review": True}` in `agent.py`) — the pause happens right before
+  it runs, after every job has already been opened and filled in, not before any browser action (see
+  `apply_jobs_agent` in "Agent graph" above for why filling isn't gated). It does nothing but serve as
+  that pause point — it no longer marks anything applied (that used to be `post_job_apply`'s job); it
+  just returns a confirmation string once resumed. The "wait for the human to review, submit, and
+  close every tab" logic lives in Streamlit's `applying_wait` phase (see "Streamlit app" above), which
+  polls `pending_tabs_open()` and only moves on to resuming `main_agent` once every tab is confirmed
+  closed. Marking a job applied is now fully decoupled from this tool/interrupt: once the run
+  completes, `streamlit_app.py` shows a "Mark as Applied" button per job row whose
+  `job_application_status` is `"applying"` (set by `start_applying`), and clicking it calls
+  `mark_job_applied` + `update_job_row` directly — a plain Streamlit action, not a graph call.
 - `extract_text` (one of the stock toolkit tools) needs `lxml` for its `BeautifulSoup` parser —
   previously only present transitively via the now-removed `browser-use` dependency, so it's now
   listed explicitly in `pyproject.toml`. Missing it fails at first use of `extract_text`, not at

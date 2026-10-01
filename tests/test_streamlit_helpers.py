@@ -40,8 +40,11 @@ def test_resume_tailoring_interrupt_moves_to_reviewing(streamlit_app):
     assert streamlit_app.advance_phase(response) == "reviewing"
 
 
-def test_post_apply_interrupt_moves_to_applying_wait(streamlit_app):
-    response = {"pathToJobsCsv": "/tmp/jobs.csv", "__interrupt__": [_interrupt("post_job_apply")]}
+def test_request_application_review_interrupt_moves_to_applying_wait(streamlit_app):
+    response = {
+        "pathToJobsCsv": "/tmp/jobs.csv",
+        "__interrupt__": [_interrupt("request_application_review")],
+    }
     assert streamlit_app.advance_phase(response) == "applying_wait"
 
 
