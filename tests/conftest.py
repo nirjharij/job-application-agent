@@ -10,12 +10,20 @@ Two conventions used throughout the suite:
 """
 
 import csv
+import os
 import sys
 import types
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+# config.py's LINKEDIN_STORAGE_STATE_PATH/OUTPUT_DIRECTORY are both os.getcwd()-based, matching the
+# app's own documented invocation (`cd app && streamlit run ...`). Match that here too, before any
+# test module imports config, so those constants resolve the same way they do in production instead
+# of leaking files into the repo root.
+os.chdir(Path(__file__).resolve().parent.parent / "app")
 
 CSV_FIELDNAMES = [
     "title",

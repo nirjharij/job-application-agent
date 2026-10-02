@@ -169,25 +169,30 @@ def test_name_not_centered_when_the_top_line_is_left_aligned(monkeypatch):
 # --- _write_resume_pdf ----------------------------------------------------------------------
 
 
-def test_write_resume_pdf_produces_a_real_pdf(tmp_path):
-    out = tmp_path / "resume.pdf"
-    _write_resume_pdf("Jane Doe\n\nEXPERIENCE\n- Built a thing\nAt Acme.", str(out), _DEFAULT_STYLE)
-    assert out.read_bytes().startswith(b"%PDF")
+def test_write_resume_pdf_produces_a_real_pdf(tmp_path, monkeypatch):
+    monkeypatch.setattr(rh, "OUTPUT_DIRECTORY", str(tmp_path))
+    filepath = _write_resume_pdf(
+        "Jane Doe\n\nEXPERIENCE\n- Built a thing\nAt Acme.", job_row(), PDF_B64, {"name": "Jane Doe"}
+    )
+    assert open(filepath, "rb").read().startswith(b"%PDF")
 
 
-def test_write_resume_pdf_transliterates_non_latin1_characters(tmp_path):
+def test_write_resume_pdf_transliterates_non_latin1_characters(tmp_path, monkeypatch):
     # fpdf2's core fonts are latin-1 only; smart quotes and bullets from LLM output would
     # otherwise blow up here rather than at review time.
-    out = tmp_path / "resume.pdf"
-    _write_resume_pdf("Jane\n\n• “led” – a team… €100k", str(out), _DEFAULT_STYLE)
-    assert out.read_bytes().startswith(b"%PDF")
+    monkeypatch.setattr(rh, "OUTPUT_DIRECTORY", str(tmp_path))
+    filepath = _write_resume_pdf(
+        "Jane\n\n• “led” – a team… €100k", job_row(), PDF_B64, {"name": "Jane"}
+    )
+    assert open(filepath, "rb").read().startswith(b"%PDF")
 
 
-def test_write_resume_pdf_honors_a_custom_style(tmp_path):
-    out = tmp_path / "resume.pdf"
+def test_write_resume_pdf_honors_a_custom_style(tmp_path, monkeypatch):
+    monkeypatch.setattr(rh, "OUTPUT_DIRECTORY", str(tmp_path))
     style = {**_DEFAULT_STYLE, "family": "Times", "accent_color": (26, 115, 232), "name_centered": True}
-    _write_resume_pdf("Jane Doe\nEXPERIENCE\nbody", str(out), style)
-    assert out.read_bytes().startswith(b"%PDF")
+    monkeypatch.setattr(rh, "_extract_style_profile", lambda pdf_base64: style)
+    filepath = _write_resume_pdf("Jane Doe\nEXPERIENCE\nbody", job_row(), PDF_B64, {"name": "Jane Doe"})
+    assert open(filepath, "rb").read().startswith(b"%PDF")
 
 
 # --- generate_tailored_resume_for_row -------------------------------------------------------
@@ -196,24 +201,29 @@ def test_write_resume_pdf_honors_a_custom_style(tmp_path):
 @pytest.fixture
 def stub_llm(monkeypatch, fake_llm):
     llm = fake_llm("Jane Doe\n\nEXPERIENCE\n- Tailored bullet")
-    monkeypatch.setattr(rh, "init_chat_model", lambda model: llm)
+    monkeypatch.setattr(rh, "get_llm", lambda: llm)
     return llm
 
 
 async def test_generate_tailored_resume_sanitizes_the_filename(tmp_path, monkeypatch, stub_llm):
-    monkeypatch.chdir(tmp_path)
-    row = job_row(company="Acme GmbH", title="A/B Test Engineer", resume_corrections="- do x")
+    monkeypatch.setattr(rh, "OUTPUT_DIRECTORY", str(tmp_path))
+    row = job_row(company="Acme/Corp GmbH", resume_corrections="- do x", apply_resume_corrections="True")
+    profile = {"name": "A/B Doe"}
 
-    filepath = await generate_tailored_resume_for_row(PDF_B64, row)
+    filepath = await generate_tailored_resume_for_row(PDF_B64, row, profile)
 
-    assert os.path.basename(filepath) == "Acme_GmbH_A-B_Test_Engineer_tailored_resume.pdf"
-    assert os.path.dirname(filepath) == str(tmp_path)
+    assert os.path.basename(filepath) == "A-B_Doe_resume.pdf"
+    assert os.path.dirname(filepath) == os.path.join(str(tmp_path), "Acme-Corp_GmbH")
     assert os.path.exists(filepath)
 
 
 async def test_generate_tailored_resume_sends_the_corrections_and_the_pdf(tmp_path, monkeypatch, stub_llm):
-    monkeypatch.chdir(tmp_path)
-    await generate_tailored_resume_for_row(PDF_B64, job_row(resume_corrections="- mirror their SQL wording"))
+    monkeypatch.setattr(rh, "OUTPUT_DIRECTORY", str(tmp_path))
+    await generate_tailored_resume_for_row(
+        PDF_B64,
+        job_row(resume_corrections="- mirror their SQL wording", apply_resume_corrections="True"),
+        {"name": "Jane"},
+    )
 
     (messages,) = stub_llm.calls
     text_block, file_block = messages[0].content
@@ -236,7 +246,7 @@ async def test_analyze_returns_a_guard_string_without_csv_or_pdf(state):
 
 async def test_analyze_adds_suggestion_columns_to_every_row(jobs_csv, monkeypatch, fake_llm):
     llm = fake_llm("- lead with Python\n- mirror their wording")
-    monkeypatch.setattr(rh, "init_chat_model", lambda model: llm)
+    monkeypatch.setattr(rh, "get_llm", lambda: llm)
 
     await analyze_resume_and_make_suggestions.coroutine(
         runtime=FakeRuntime(state={"pathToJobsCsv": jobs_csv, "pdfBase64": PDF_B64})
@@ -250,7 +260,7 @@ async def test_analyze_adds_suggestion_columns_to_every_row(jobs_csv, monkeypatc
 
 
 async def test_analyze_defaults_every_row_to_not_applied(jobs_csv, monkeypatch, fake_llm):
-    monkeypatch.setattr(rh, "init_chat_model", lambda model: fake_llm("- do x"))
+    monkeypatch.setattr(rh, "get_llm", lambda: fake_llm("- do x"))
 
     await analyze_resume_and_make_suggestions.coroutine(
         runtime=FakeRuntime(state={"pathToJobsCsv": jobs_csv, "pdfBase64": PDF_B64})
@@ -262,7 +272,7 @@ async def test_analyze_defaults_every_row_to_not_applied(jobs_csv, monkeypatch, 
 
 async def test_analyze_sends_each_job_description_to_the_model(jobs_csv, monkeypatch, fake_llm):
     llm = fake_llm("- do x")
-    monkeypatch.setattr(rh, "init_chat_model", lambda model: llm)
+    monkeypatch.setattr(rh, "get_llm", lambda: llm)
 
     await analyze_resume_and_make_suggestions.coroutine(
         runtime=FakeRuntime(state={"pathToJobsCsv": jobs_csv, "pdfBase64": PDF_B64})
@@ -288,10 +298,14 @@ async def test_analyze_on_an_empty_csv_raises(tmp_path):
 
 @pytest.fixture
 def stub_generate(monkeypatch):
-    """Patch the generator rather than the LLM — this tool's logic is the apply gate, not the model."""
+    """Patch the generator rather than the LLM. resume_corrections_and_download now calls this for
+    every row unconditionally and relies on the approve/skip gate living inside the generator
+    itself, so the fake mirrors that gate rather than always "generating"."""
     generated = []
 
-    async def fake_generate(pdf_base64, row):
+    async def fake_generate(pdf_base64, row, profile):
+        if row.get("apply_resume_corrections", "").strip().lower() != "true":
+            return rh.ORIGINAL_RESUME_FILE_PATH
         path = f"/generated/{row['company']}_tailored_resume.pdf"
         generated.append((row["url"], path))
         return path
@@ -343,7 +357,7 @@ async def test_only_approved_rows_get_a_tailored_path(tmp_path, stub_generate):
     assert "tailored_resume_path" in fieldnames
     assert [r["tailored_resume_path"] for r in rows] == [
         "/generated/Co0_tailored_resume.pdf",
-        "",  # skipped rows get an empty string, never a missing key
+        rh.ORIGINAL_RESUME_FILE_PATH,  # skipped rows fall back to the original resume, never blank
         "/generated/Co2_tailored_resume.pdf",
     ]
 

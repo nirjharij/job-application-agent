@@ -104,7 +104,7 @@ def apply_env(monkeypatch, fake_llm):
 
     def _setup(fill_results=None):
         llm = fake_llm("done")
-        monkeypatch.setattr(aj, "init_chat_model", lambda model: llm)
+        monkeypatch.setattr(aj, "get_llm", lambda: llm)
 
         async def fake_tools():
             return [FakeTool("browser_navigate")]
@@ -141,10 +141,15 @@ async def test_start_applying_processes_every_row_sequentially(jobs_csv, apply_e
     assert "Processed 2 job(s):" in result.content
 
 
-async def test_start_applying_formats_the_applicant_profile(jobs_csv, apply_env):
+async def test_start_applying_formats_the_applicant_profile(jobs_csv, apply_env, monkeypatch):
     seen = apply_env()
     profile = {"name": "Jane", "email": "jane@example.com", "phone": "", "notice_period": None}
-    runtime = FakeRuntime(state={"pathToJobsCsv": jobs_csv}, context=FakeProfileContext(profile))
+
+    async def fake_extract(pdf_base64):
+        return profile
+
+    monkeypatch.setattr(aj, "get_or_extract_applicant_profile", fake_extract)
+    runtime = FakeRuntime(state={"pathToJobsCsv": jobs_csv, "pdfBase64": "fake-pdf-bytes"})
 
     await start_applying.coroutine(runtime=runtime)
 
@@ -177,7 +182,7 @@ async def test_start_applying_binds_the_mcp_tools_to_the_model(jobs_csv, apply_e
     runtime = FakeRuntime(state={"pathToJobsCsv": jobs_csv}, context=FakeProfileContext({}))
     await start_applying.coroutine(runtime=runtime)
 
-    assert [t.name for t in aj.init_chat_model("m").bound_tools] == ["browser_navigate"]
+    assert [t.name for t in aj.get_llm().bound_tools] == ["browser_navigate"]
 
 
 # --- pending_tabs_open ----------------------------------------------------------------------
